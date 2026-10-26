@@ -451,7 +451,7 @@ fn handle_frame(
     let mut input = frame.clone();
     input.set_channel_layout(converter.layout);
     converter.context.run(&input, &mut converter.output)?;
-    append_planar(&converter.output, converter.channels, samples)?;
+    append_interleaved(&converter.output, converter.channels, samples)?;
     Ok(())
 }
 
@@ -468,12 +468,12 @@ fn flush_converter(
         if output.samples() == 0 {
             break;
         }
-        append_planar(&output, converter.channels, samples)?;
+        append_interleaved(&output, converter.channels, samples)?;
     }
     Ok(())
 }
 
-fn append_planar(
+fn append_interleaved(
     frame: &ffmpeg::frame::Audio,
     channels: usize,
     samples: &mut Vec<f32>,
@@ -492,9 +492,11 @@ fn append_planar(
         )
         .into());
     }
-    for channel in 0..channels {
-        let plane = frame.plane::<f32>(channel);
-        samples.extend_from_slice(&plane[..frames]);
+    samples.reserve(frames * channels);
+    for i in 0..frames {
+        for channel in 0..channels {
+            samples.push(frame.plane::<f32>(channel)[i]);
+        }
     }
     Ok(())
 }
