@@ -3,10 +3,10 @@
 A standalone E-AC-3 encoder written in Rust.
 
 `reac3e` produces raw E-AC-3 syncframes at 48 kHz. It implements the coding
-tools needed for high-quality output: KBD-windowed MDCT, differential exponent
-coding, channel coupling, stereo rematrixing, CBR bit allocation and mantissa
-packing. The public API is frame- or stream-oriented and has no container or
-Dolby-specific metadata dependency.
+tools needed for high-quality output: KBD-windowed MDCT, block switching,
+differential exponent coding, channel coupling, stereo rematrixing, CBR bit
+allocation and mantissa packing. The public API is frame- or stream-oriented
+and has no container or Dolby-specific metadata dependency.
 
 ## Scope
 
@@ -17,6 +17,10 @@ Supported:
 - optional LFE
 - 1, 2, 3 or 6 blocks per syncframe
 - CBR
+- block switching with the A/52 transient detector; enabled by default at up
+  to 64 kbps per channel and disabled with `--no-block-switch`
+- low-rate bandwidth flooring so E-AC-3 does not collapse to a 6.8 kHz
+  high-frequency limit at 96 kbps stereo
 - channel coupling (auto / on / off)
 - stereo rematrixing
 - the BSI metadata fields that the E-AC-3 syntax exposes (dialnorm, mixing and
@@ -27,7 +31,7 @@ Not supported (these return a clear configuration error):
 - AC-3 encoding
 - sample rates other than 48 kHz
 - AHT, spectral extension, enhanced coupling, transient pre-noise
-- block switching, delta bit allocation, dither
+- delta bit allocation, dither
 - VBR / ABR
 - dependent substreams or layouts above 5.1
 
@@ -86,9 +90,9 @@ cargo run --release --example reac3e -- input.wav output.ec3 --layout 5.1 -b 448
 Input channel counts of 1, 2, 3, 4, 5 and 6 map to mono, stereo, 3.0, 4.0,
 5.0 and 5.1 respectively; use `--layout` to select another supported AC-3
 layout (for example `2.1`, `3.1` or `4.1`). Channels are expected in WAVE
-order. `--dialnorm`, `--coupling`, `--no-rematrixing` and `--quiet` expose the
-remaining encoder options. Use `--help` for the full list. The output is raw
-E-AC-3 syncframes, not a container format.
+order. `--dialnorm`, `--coupling`, `--no-rematrixing`, `--no-block-switch`
+and `--quiet` expose the remaining encoder options. Use `--help` for the full
+list. The output is raw E-AC-3 syncframes, not a container format.
 
 ### ViSQOL measurement
 
