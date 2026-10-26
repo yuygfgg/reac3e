@@ -484,7 +484,23 @@ impl EncoderConfig {
         let frame_size_min = 2 * words_per_frame as usize;
 
         let bitrate_code = closest_bitrate_code(bitrate);
-        let bandwidth_code = BANDWIDTH_TAB[fbw_channels - 1][0][bitrate_code] as usize;
+        let mut bandwidth_code = BANDWIDTH_TAB[fbw_channels - 1][0][bitrate_code] as usize;
+        // The AC-3 bandwidth table is a poor fit for low-rate E-AC-3.
+        if bitrate_code >= 4 {
+            let floor = if fbw_channels <= 2 {
+                44
+            } else if fbw_channels >= 5 {
+                match bitrate_code {
+                    0..=5 => 0,
+                    6 => 12,
+                    7 | 8 => 28,
+                    _ => 48,
+                }
+            } else {
+                28
+            };
+            bandwidth_code = bandwidth_code.max(floor);
+        }
         let coupling = coupling_layout(self.coupling, channel_mode, bandwidth_code, bitrate_code);
 
         let mut start_freq = [0usize; 8];
@@ -684,6 +700,21 @@ mod tests {
         let on_448 = validate(Acmod::ThreeTwo, true, 448_000, Coupling::On);
         assert!(on_448.cpl_enabled);
         assert_eq!(on_448.cpl_start_freq, 12 * 12 + 37);
+    }
+
+    #[test]
+    fn low_rate_bandwidth_is_not_zero() {
+        let stereo_96 = validate(Acmod::Stereo, false, 96_000, Coupling::Auto);
+        assert_eq!(stereo_96.bandwidth_code, 44);
+        let stereo_192 = validate(Acmod::Stereo, false, 192_000, Coupling::Auto);
+        assert!(stereo_192.bandwidth_code >= 48);
+
+        let five_one_96 = validate(Acmod::ThreeTwo, true, 96_000, Coupling::Auto);
+        assert_eq!(five_one_96.bandwidth_code, 12);
+        let five_one_128 = validate(Acmod::ThreeTwo, true, 128_000, Coupling::Auto);
+        assert_eq!(five_one_128.bandwidth_code, 28);
+        let five_one_224 = validate(Acmod::ThreeTwo, true, 224_000, Coupling::Auto);
+        assert_eq!(five_one_224.bandwidth_code, 48);
     }
 
     #[test]
