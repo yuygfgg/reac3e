@@ -10,6 +10,12 @@ pub(crate) fn write_audio_block(enc: &FrameEncoder, blk: usize, w: &mut BitWrite
     let cfg = &enc.cfg;
     let block = &enc.blocks[blk];
 
+    if enc.blk_sw_syntax {
+        for ch in 1..=cfg.fbw_channels {
+            w.write_bool(enc.blksw[ch][blk]);
+        }
+    }
+
     w.write_bool(false); // dynamic range codes disabled
     w.write_bool(false); // spectral extension disabled
 

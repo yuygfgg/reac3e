@@ -105,7 +105,7 @@ fn write_frame_flags(enc: &FrameEncoder, w: &mut BitWriter) {
     }
     w.write(2, 0); // SNR offset strategy
     w.write_bool(false); // transient pre-noise disabled
-    w.write_bool(false); // block switch syntax disabled
+    w.write_bool(enc.blk_sw_syntax); // block switch syntax
     w.write_bool(false); // dither syntax disabled
     w.write_bool(false); // bit allocation model syntax disabled
     w.write_bool(false); // fast gain codes disabled

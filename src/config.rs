@@ -366,13 +366,25 @@ fn coupling_layout(
     }
 
     let table_start = COUPLING_START_TAB[(channel_mode - 2) as usize][0][bitrate_code];
-    let start = match (coupling, table_start) {
+    let mut start = match (coupling, table_start) {
         (Coupling::Off, _) => return CouplingLayout::DISABLED,
         (Coupling::Auto, start) if start < 0 => return CouplingLayout::DISABLED,
         (Coupling::Auto, start) => start as i32,
         (Coupling::On, start) if start < 0 => 15,
         (Coupling::On, start) => start as i32,
     };
+
+    // The reference coupling-start table is conservative for 5.1 at
+    // 256-512 kbps.  Starting automatic coupling lower (band 6) improved
+    // both ViSQOL and segmental SNR on real 5.1 downmixes.  Explicit `On`
+    // keeps the reference start so callers can still request the old
+    // behaviour.
+    if channel_mode == Acmod::ThreeTwo.channel_mode()
+        && coupling == Coupling::Auto
+        && (12..=16).contains(&bitrate_code)
+    {
+        start = start.min(6);
+    }
 
     let end_band = bandwidth_code / 4 + 3;
     let max_start = (end_band - 1).min(15) as i32;
@@ -656,6 +668,22 @@ mod tests {
         assert!(on.num_cpl_bands > 0);
         assert!(on.cpl_start_freq >= 37);
         assert!(on.cpl_start_freq < on.cpl_end_freq);
+    }
+
+    #[test]
+    fn five_one_auto_coupling_starts_at_band_six() {
+        for bitrate in [256_000, 320_000, 384_000, 448_000, 512_000] {
+            let cfg = validate(Acmod::ThreeTwo, true, bitrate, Coupling::Auto);
+            assert!(cfg.cpl_enabled, "coupling should be enabled at {bitrate}");
+            assert_eq!(cfg.cpl_start_freq, 6 * 12 + 37, "bitrate {bitrate}");
+        }
+
+        let auto_640 = validate(Acmod::ThreeTwo, true, 640_000, Coupling::Auto);
+        assert!(!auto_640.cpl_enabled);
+
+        let on_448 = validate(Acmod::ThreeTwo, true, 448_000, Coupling::On);
+        assert!(on_448.cpl_enabled);
+        assert_eq!(on_448.cpl_start_freq, 12 * 12 + 37);
     }
 
     #[test]

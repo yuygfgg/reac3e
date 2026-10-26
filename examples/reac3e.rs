@@ -68,6 +68,10 @@ struct Cli {
     #[arg(long)]
     no_rematrixing: bool,
 
+    /// Disable block switching (enabled by default).
+    #[arg(long)]
+    no_block_switch: bool,
+
     /// Suppress informational messages on stderr.
     #[arg(short, long)]
     quiet: bool,
@@ -187,6 +191,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     };
 
     let mut encoder = StreamEncoder::new(config)?;
+    encoder.set_block_switch(!cli.no_block_switch);
     let mut output = open_output(&cli.output)?;
     let chunk_samples = 4096 * channels;
     let mut syncframes = 0u64;

@@ -19,11 +19,17 @@ use crate::tables::{
     AC3_BLOCK_SIZE, AC3_CHMODE_2F2R, AC3_CHMODE_MONO, AC3_CHMODE_STEREO, AC3_MAX_BLOCKS,
     AC3_MAX_CHANNELS, AC3_MAX_COEFS, EAC3_FRM_EXPSTR, FAST_GAIN_TAB,
 };
+use crate::transient::TransientDetector;
 
 /// Internal channel slots: coupling channel 0, fullband 1..=fbw, LFE last.
 pub(crate) const CH: usize = AC3_MAX_CHANNELS + 1;
 
 const EXP_DIFF_THRESHOLD: i32 = 500;
+
+/// Block switching costs a coupling-off frame and a second transform; below
+/// this per-channel rate it has measured benefits on transient material,
+/// above it the gain disappears and the coupling loss dominates.
+const BLOCK_SWITCH_MAX_BPS_PER_CHANNEL: u32 = 64_000;
 
 /// State of a coupling update flag in the E-AC-3 syntax.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,6 +242,10 @@ pub struct FrameEncoder {
     budget: FrameBudget,
     pub(crate) frame_index: u64,
     final_frame_seen: bool,
+    pub(crate) blksw: [[bool; AC3_MAX_BLOCKS]; CH],
+    pub(crate) blk_sw_syntax: bool,
+    block_switch: bool,
+    transient: Vec<TransientDetector>,
 }
 
 impl FrameEncoder {
@@ -267,7 +277,16 @@ impl FrameEncoder {
             budget: FrameBudget::default(),
             frame_index: 0,
             final_frame_seen: false,
+            blksw: [[false; AC3_MAX_BLOCKS]; CH],
+            blk_sw_syntax: false,
+            block_switch: true,
+            transient: (0..CH).map(|_| TransientDetector::new()).collect(),
         })
+    }
+
+    /// Enable or disable block switching (enabled by default).
+    pub fn set_block_switch(&mut self, enabled: bool) {
+        self.block_switch = enabled;
     }
 
     /// Samples represented by one syncframe (1536 for six blocks).
@@ -314,8 +333,10 @@ impl FrameEncoder {
         let spf = self.samples_per_frame();
         self.adjust_frame_size();
 
-        // --- apply MDCT ---
+        // --- block-switch detection and MDCT ---
         let num_blocks = self.cfg.num_blocks;
+        self.blksw = [[false; AC3_MAX_BLOCKS]; CH];
+        let mut any_switched = false;
         for (ch, channel) in channels
             .iter()
             .enumerate()
@@ -328,20 +349,54 @@ impl FrameEncoder {
             if valid < spf {
                 input.resize(AC3_BLOCK_SIZE + spf, 0.0);
             }
+
+            let switch_allowed = self.block_switch
+                && self.cfg.bit_rate / self.cfg.channels as u32 <= BLOCK_SWITCH_MAX_BPS_PER_CHANNEL;
+            if switch_allowed && ch <= self.cfg.fbw_channels {
+                // Once an onset switches the channel, keep the rest of the
+                // frame short.  The decay/reverb tail is part of the same
+                // transient event; returning to a long block immediately
+                // reintroduces pre-echo on the following block.  Measured on
+                // real transient material this is consistently better than a
+                // one- or two-block hold.
+                let mut hold_to_frame_end = false;
+                for blk in 0..num_blocks {
+                    let start = AC3_BLOCK_SIZE + blk * AC3_BLOCK_SIZE;
+                    let segment = &input[start..start + AC3_BLOCK_SIZE];
+                    if self.transient[ch].detect(segment) {
+                        hold_to_frame_end = true;
+                    }
+                    if hold_to_frame_end {
+                        self.blksw[ch][blk] = true;
+                        any_switched = true;
+                    }
+                }
+            }
+
             let mut windowed = [0.0f32; AC3_BLOCK_SIZE * 2];
             for blk in 0..num_blocks {
                 let start = blk * AC3_BLOCK_SIZE;
                 self.mdct
                     .window_block(&input[start..start + AC3_BLOCK_SIZE * 2], &mut windowed);
-                self.mdct
-                    .process(&windowed, &mut self.blocks[blk].mdct_coef[ch]);
+                if self.blksw[ch][blk] {
+                    let (first, second) = windowed.split_at(AC3_BLOCK_SIZE);
+                    self.mdct
+                        .process_short(first, second, &mut self.blocks[blk].mdct_coef[ch]);
+                } else {
+                    self.mdct
+                        .process(&windowed, &mut self.blocks[blk].mdct_coef[ch]);
+                }
             }
             self.tail[ch].copy_from_slice(&input[spf..spf + AC3_BLOCK_SIZE]);
         }
+        self.blk_sw_syntax = any_switched;
 
         // --- coupling strategy + coupling channel ---
-        self.cpl_on =
-            coupling::compute_coupling_strategy(&self.cfg, &mut self.blocks, self.cfg.cpl_enabled);
+        self.cpl_on = coupling::compute_coupling_strategy(
+            &self.cfg,
+            &mut self.blocks,
+            self.cfg.cpl_enabled && !self.blk_sw_syntax,
+        );
         if self.cpl_on {
             coupling::apply_channel_coupling(
                 &self.cfg,
@@ -597,8 +652,8 @@ impl FrameEncoder {
 
         // Reuse blocks point at the reference block's allocation.
         for ch in start_ch..=self.cfg.channels {
-            for (blk, block) in self.blocks.iter().enumerate() {
-                if ch == 0 && !block.cpl_in_use {
+            for blk in 0..self.cfg.num_blocks {
+                if ch == 0 && !self.blocks[blk].cpl_in_use {
                     continue;
                 }
                 if self.exp_strategy[ch][blk].is_reuse() {
@@ -731,6 +786,10 @@ impl FrameEncoder {
         let cfg = &self.cfg;
         let mut bits = 0;
 
+        if self.blk_sw_syntax {
+            bits += cfg.fbw_channels as i32;
+        }
+
         if block.new_cpl_strategy && block.cpl_in_use {
             bits += 1;
             if cfg.channel_mode != AC3_CHMODE_STEREO {
@@ -788,6 +847,7 @@ impl FrameEncoder {
                 bits += 3 + 3;
             }
         }
+
         bits
     }
 
@@ -958,6 +1018,11 @@ pub struct StreamEncoder {
 }
 
 impl StreamEncoder {
+    /// Enable or disable block switching.
+    pub fn set_block_switch(&mut self, enabled: bool) {
+        self.encoder.set_block_switch(enabled);
+    }
+
     pub fn new(config: EncoderConfig) -> Result<Self, EncodeError> {
         let encoder = FrameEncoder::new(config)?;
         let channels = encoder.cfg.channels;

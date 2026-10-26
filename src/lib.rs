@@ -31,6 +31,7 @@ mod pcm;
 mod quantize;
 mod rematrix;
 mod tables;
+mod transient;
 
 pub use config::{
     Acmod, AdConverterType, BsiMetadata, ChannelLayout, ChannelOrder, Coupling, DolbyHeadphoneMode,
