@@ -1,0 +1,21 @@
+[package]
+name = "reac3e"
+version = "0.1.0"
+edition = "2024"
+description = "A standalone E-AC-3 encoder"
+license = "LGPL-2.1-or-later"
+readme = "README.md"
+publish = false
+
+[lib]
+name = "reac3e"
+path = "src/lib.rs"
+
+[dependencies]
+rustfft = "6"
+thiserror = "2"
+
+[dev-dependencies]
+clap = { version = "4", features = ["derive"] }
+ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-resampling"] }
+libc = "0.2"

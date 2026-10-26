@@ -1,0 +1,11 @@
+Portions of the encoder algorithm and the associated constant tables are
+derived from the FFmpeg project's floating-point E-AC-3 encoder:
+
+  Copyright (c) 2000 Fabrice Bellard
+  Copyright (c) 2006-2011 Justin Ruggles <justin.ruggles@gmail.com>
+  Copyright (c) 2006-2010 Prakash Punnoor <prakash@punnoor.de>
+  Copyright (c) 2007 Bartlomiej Wolowiec <bartek.wolowiec@gmail.com>
+
+FFmpeg is licensed under the GNU Lesser General Public License, version 2.1
+or later.  The derived work in this repository is distributed under the same
+terms; see LICENSE.
