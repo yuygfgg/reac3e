@@ -99,6 +99,7 @@ mod tests {
             metadata: Default::default(),
             coupling: Coupling::Off,
             stereo_rematrixing: true,
+            cutoff_hz: None,
         }
         .validate()
         .unwrap()

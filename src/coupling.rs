@@ -477,6 +477,7 @@ mod tests {
             metadata: Default::default(),
             coupling: Coupling::Auto,
             stereo_rematrixing: false,
+            cutoff_hz: None,
         }
         .validate()
         .unwrap()

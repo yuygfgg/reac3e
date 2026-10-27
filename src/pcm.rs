@@ -77,6 +77,7 @@ mod tests {
             metadata: Default::default(),
             coupling: crate::config::Coupling::Auto,
             stereo_rematrixing: true,
+            cutoff_hz: None,
         }
         .validate()
         .unwrap()

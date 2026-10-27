@@ -74,6 +74,7 @@ pub fn encode_ours(case: &Case, pcm: &[f32], metadata: &BsiMetadata) -> Vec<Fram
         metadata: metadata.clone(),
         coupling: case.coupling,
         stereo_rematrixing: case.rematrix,
+        cutoff_hz: None,
     };
     let mut enc = StreamEncoder::new(cfg).unwrap();
     let mut frames = Vec::new();

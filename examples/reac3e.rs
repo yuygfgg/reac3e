@@ -72,6 +72,10 @@ struct Cli {
     #[arg(long)]
     no_block_switch: bool,
 
+    /// Override the coded bandwidth cutoff in Hz (default: automatic).
+    #[arg(long, value_name = "HZ")]
+    cutoff_hz: Option<u32>,
+
     /// Suppress informational messages on stderr.
     #[arg(short, long)]
     quiet: bool,
@@ -188,6 +192,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         metadata: BsiMetadata::default(),
         coupling: cli.coupling.into(),
         stereo_rematrixing: !cli.no_rematrixing,
+        cutoff_hz: cli.cutoff_hz,
     };
 
     let mut encoder = StreamEncoder::new(config)?;
@@ -226,12 +231,13 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             eprintln!("resampled: {} Hz -> {} Hz", source_rate, SAMPLE_RATE);
         }
         eprintln!(
-            "layout: {} ({} ch), bitrate: {} kbps, dialnorm: {} dB, coupling: {:?}",
+            "layout: {} ({} ch), bitrate: {} kbps, dialnorm: {} dB, coupling: {:?}, cutoff: {:.0} Hz",
             layout_name(layout),
             layout.channels(),
             bitrate_kbps,
             cli.dialnorm,
-            cli.coupling
+            cli.coupling,
+            encoder.cutoff_hz()
         );
         eprintln!("output: {destination}, {syncframes} syncframes, {bytes_written} bytes");
     }

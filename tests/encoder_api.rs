@@ -19,6 +19,7 @@ fn config(
         metadata: BsiMetadata::default(),
         coupling,
         stereo_rematrixing,
+        cutoff_hz: None,
     }
 }
 

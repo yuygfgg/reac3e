@@ -50,6 +50,7 @@ let cfg = EncoderConfig {
     metadata: BsiMetadata::default(),
     coupling: Coupling::Auto,
     stereo_rematrixing: true,
+    cutoff_hz: None,
 };
 
 let mut enc = FrameEncoder::new(cfg)?;
@@ -90,8 +91,10 @@ cargo run --release --example reac3e -- input.wav output.ec3 --layout 5.1 -b 448
 Input channel counts of 1, 2, 3, 4, 5 and 6 map to mono, stereo, 3.0, 4.0,
 5.0 and 5.1 respectively; use `--layout` to select another supported AC-3
 layout (for example `2.1`, `3.1` or `4.1`). Channels are expected in WAVE
-order. `--dialnorm`, `--coupling`, `--no-rematrixing`, `--no-block-switch`
-and `--quiet` expose the remaining encoder options. Use `--help` for the full
+order. `--dialnorm`, `--coupling`, `--no-rematrixing`, `--no-block-switch`,
+`--cutoff-hz` and `--quiet` expose the remaining encoder options.  The
+bandwidth cutoff defaults to a bitrate-dependent table; `--cutoff-hz` overrides
+it (the nearest representable E-AC-3 bandwidth code is used). Use `--help` for the full
 list. The output is raw E-AC-3 syncframes, not a container format.
 
 ### ViSQOL measurement

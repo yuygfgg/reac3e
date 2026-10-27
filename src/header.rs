@@ -229,6 +229,7 @@ mod tests {
             metadata: Default::default(),
             coupling: Coupling::Auto,
             stereo_rematrixing: true,
+            cutoff_hz: None,
         });
         assert_eq!(&bytes[..2], &[0x0B, 0x77]);
     }
@@ -259,6 +260,7 @@ mod tests {
             metadata,
             coupling: Coupling::Auto,
             stereo_rematrixing: false,
+            cutoff_hz: None,
         });
 
         let mut bits = BitReader::new(&bytes);
@@ -311,6 +313,7 @@ mod tests {
             metadata: BsiMetadata::default(),
             coupling: Coupling::Auto,
             stereo_rematrixing: true,
+            cutoff_hz: None,
         };
         let mut encoder = FrameEncoder::new(cfg).unwrap();
         assert_eq!(encoder.samples_per_frame(), 3 * 256);
@@ -354,6 +357,7 @@ mod tests {
             metadata: BsiMetadata::default(),
             coupling: Coupling::Auto,
             stereo_rematrixing: false,
+            cutoff_hz: None,
         });
 
         let mut bits = BitReader::new(&bytes);

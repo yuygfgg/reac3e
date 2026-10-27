@@ -212,6 +212,13 @@ pub struct EncoderConfig {
     pub metadata: BsiMetadata,
     pub coupling: Coupling,
     pub stereo_rematrixing: bool,
+    /// Override the coded bandwidth cutoff in Hz.
+    ///
+    /// `None` uses the bitrate/channel-mode bandwidth table (with the
+    /// low-rate floor).  `Some(hz)` replaces both and selects the nearest
+    /// representable E-AC-3 bandwidth code; the actual cutoff is reported by
+    /// [`FrameEncoder::cutoff_hz`](crate::FrameEncoder::cutoff_hz).
+    pub cutoff_hz: Option<u32>,
 }
 
 /// Metadata after validation and defaulting, ready for the bitstream.
@@ -289,6 +296,14 @@ pub(crate) struct ValidatedConfig {
     pub metadata: ValidatedMetadata,
 }
 
+impl ValidatedConfig {
+    /// Actual coded bandwidth cutoff in Hz.
+    pub(crate) fn cutoff_hz(&self) -> f64 {
+        let bin_hz = SAMPLE_RATE as f64 / 512.0;
+        (self.bandwidth_code * 3 + 73) as f64 * bin_hz
+    }
+}
+
 /// Table mapping SMPTE/native order to AC-3 order: `[channel_mode][lfe][ch]`.
 const AC3_ENC_CHANNEL_MAP: [[[usize; 6]; 2]; 8] = [
     [[0, 1, 0, 0, 0, 0], [0, 1, 2, 0, 0, 0]],
@@ -328,6 +343,28 @@ fn closest_bitrate_code(bitrate: i64) -> usize {
         .enumerate()
         .min_by_key(|&(_, &rate)| (rate as i64 * 1000 - bitrate).abs())
         .map_or(0, |(index, _)| index)
+}
+
+/// Lowest and highest representable bandwidth codes for 48 kHz.
+const MIN_BANDWIDTH_CODE: usize = 0;
+const MAX_BANDWIDTH_CODE: usize = 60;
+
+/// Convert a requested cutoff frequency to the nearest E-AC-3 bandwidth code.
+///
+/// The coded bandwidth is `(3 * code + 73)` MDCT bins, and a 48 kHz bin is
+/// `48000 / 512 = 93.75 Hz`.
+fn cutoff_to_bandwidth_code(hz: u32) -> Result<usize, EncodeError> {
+    let bin_hz = SAMPLE_RATE as f64 / 512.0;
+    let min_hz = (MIN_BANDWIDTH_CODE * 3 + 73) as f64 * bin_hz;
+    let max_hz = (MAX_BANDWIDTH_CODE * 3 + 73) as f64 * bin_hz;
+    let hz = hz as f64;
+    if !(min_hz..=max_hz).contains(&hz) {
+        return Err(EncodeError::Config(format!(
+            "cutoff_hz must be between {min_hz:.0} and {max_hz:.0} Hz"
+        )));
+    }
+    let code = ((hz / bin_hz - 73.0) / 3.0).round() as usize;
+    Ok(code.clamp(MIN_BANDWIDTH_CODE, MAX_BANDWIDTH_CODE))
 }
 
 fn validate_float_option(value: f32, options: &[f32]) -> Option<usize> {
@@ -484,23 +521,28 @@ impl EncoderConfig {
         let frame_size_min = 2 * words_per_frame as usize;
 
         let bitrate_code = closest_bitrate_code(bitrate);
-        let mut bandwidth_code = BANDWIDTH_TAB[fbw_channels - 1][0][bitrate_code] as usize;
-        // The AC-3 bandwidth table is a poor fit for low-rate E-AC-3.
-        if bitrate_code >= 4 {
-            let floor = if fbw_channels <= 2 {
-                44
-            } else if fbw_channels >= 5 {
-                match bitrate_code {
-                    0..=5 => 0,
-                    6 => 12,
-                    7 | 8 => 28,
-                    _ => 48,
-                }
-            } else {
-                28
-            };
-            bandwidth_code = bandwidth_code.max(floor);
-        }
+        let bandwidth_code = if let Some(hz) = self.cutoff_hz {
+            cutoff_to_bandwidth_code(hz)?
+        } else {
+            let mut code = BANDWIDTH_TAB[fbw_channels - 1][0][bitrate_code] as usize;
+            // The AC-3 bandwidth table is a poor fit for low-rate E-AC-3.
+            if bitrate_code >= 4 {
+                let floor = if fbw_channels <= 2 {
+                    44
+                } else if fbw_channels >= 5 {
+                    match bitrate_code {
+                        0..=5 => 0,
+                        6 => 12,
+                        7 | 8 => 28,
+                        _ => 48,
+                    }
+                } else {
+                    28
+                };
+                code = code.max(floor);
+            }
+            code
+        };
         let coupling = coupling_layout(self.coupling, channel_mode, bandwidth_code, bitrate_code);
 
         let mut start_freq = [0usize; 8];
@@ -648,6 +690,7 @@ mod tests {
             metadata: BsiMetadata::default(),
             coupling,
             stereo_rematrixing: true,
+            cutoff_hz: None,
         }
         .validate()
         .unwrap()
@@ -718,6 +761,35 @@ mod tests {
     }
 
     #[test]
+    fn cutoff_override_selects_the_nearest_bandwidth_code() {
+        assert_eq!(cutoff_to_bandwidth_code(15_000).unwrap(), 29);
+        assert_eq!(cutoff_to_bandwidth_code(19_200).unwrap(), 44);
+        assert!(cutoff_to_bandwidth_code(1_000).is_err());
+        assert!(cutoff_to_bandwidth_code(24_000).is_err());
+    }
+
+    #[test]
+    fn cutoff_override_replaces_the_low_rate_floor() {
+        let cfg = EncoderConfig {
+            layout: ChannelLayout {
+                acmod: Acmod::Stereo,
+                lfe: false,
+            },
+            bitrate_bps: 96_000,
+            dialnorm: -27,
+            metadata: BsiMetadata::default(),
+            coupling: Coupling::Auto,
+            stereo_rematrixing: true,
+            cutoff_hz: Some(15_000),
+        }
+        .validate()
+        .unwrap();
+
+        assert_eq!(cfg.bandwidth_code, 29);
+        assert!((cfg.cutoff_hz() - 15_000.0).abs() < 1.0);
+    }
+
+    #[test]
     fn coupling_requires_a_layout_with_surround_channels() {
         for acmod in [Acmod::DualMono, Acmod::Mono, Acmod::Stereo] {
             for coupling in [Coupling::Auto, Coupling::On, Coupling::Off] {
@@ -751,6 +823,7 @@ mod tests {
             },
             coupling: Coupling::Auto,
             stereo_rematrixing: false,
+            cutoff_hz: None,
         }
         .validate()
         .unwrap();

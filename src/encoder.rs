@@ -294,6 +294,11 @@ impl FrameEncoder {
         AC3_BLOCK_SIZE * self.cfg.num_blocks
     }
 
+    /// Actual coded bandwidth cutoff in Hz.
+    pub fn cutoff_hz(&self) -> f64 {
+        self.cfg.cutoff_hz()
+    }
+
     /// Encoder delay introduced by the initial 256-sample overlap window,
     /// matching the initial overlap padding.
     pub fn latency(&self) -> usize {
@@ -1023,6 +1028,11 @@ impl StreamEncoder {
         self.encoder.set_block_switch(enabled);
     }
 
+    /// Actual coded bandwidth cutoff in Hz.
+    pub fn cutoff_hz(&self) -> f64 {
+        self.encoder.cutoff_hz()
+    }
+
     pub fn new(config: EncoderConfig) -> Result<Self, EncodeError> {
         let encoder = FrameEncoder::new(config)?;
         let channels = encoder.cfg.channels;
@@ -1096,6 +1106,7 @@ mod tests {
             metadata: Default::default(),
             coupling,
             stereo_rematrixing: false,
+            cutoff_hz: None,
         }
         .validate()
         .unwrap()
