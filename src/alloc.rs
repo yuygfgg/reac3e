@@ -1,10 +1,9 @@
 //! Bit allocation pointers, mantissa bit counting and the CBR SNR search.
 
-use crate::tables::{
-    AC3_MAX_BLOCKS, AC3_MAX_COEFS, BAND_START_TAB, BAP_BITS, BAP_TAB, BIN_TO_BAND_TAB,
-};
+use crate::tables::{AC3_MAX_BLOCKS, AC3_MAX_COEFS, BAND_START_TAB, BAP_BITS, BIN_TO_BAND_TAB};
 
 /// Assign a bit-allocation pointer to every coefficient in a band range.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn calc_bap(
     mask: &[i16],
     psd: &[i16],
@@ -12,6 +11,7 @@ pub(crate) fn calc_bap(
     end: usize,
     snr_offset: i32,
     floor: i32,
+    table: &[u8; 64],
     bap: &mut [u8],
 ) {
     if snr_offset == -960 {
@@ -27,7 +27,7 @@ pub(crate) fn calc_bap(
     let mut bin = start;
     while bin < end.min(28) {
         let address = ((psd[bin] as i32 - mask_offset(bin)) >> 5).clamp(0, 63) as usize;
-        bap[bin] = BAP_TAB[address];
+        bap[bin] = table[address];
         bin += 1;
     }
     if bin >= end {
@@ -41,7 +41,7 @@ pub(crate) fn calc_bap(
         let band_end = (BAND_START_TAB[band] as usize).min(end);
         while bin < band_end {
             let address = ((psd[bin] as i32 - offset) >> 5).clamp(0, 63) as usize;
-            bap[bin] = BAP_TAB[address];
+            bap[bin] = table[address];
             bin += 1;
         }
         if end <= band_end {
@@ -127,6 +127,7 @@ pub(crate) fn split_snr_offset(snr: i32) -> (u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tables::BAP_TAB;
 
     #[test]
     fn mantissa_size_matches_grouping() {
@@ -165,7 +166,7 @@ mod tests {
         let mask = [0i16; 256];
         let psd = [0i16; 256];
         let mut bap = [9u8; 256];
-        calc_bap(&mask, &psd, 0, 256, -960, 0, &mut bap);
+        calc_bap(&mask, &psd, 0, 256, -960, 0, &BAP_TAB, &mut bap);
         assert!(bap.iter().all(|&value| value == 0));
     }
 

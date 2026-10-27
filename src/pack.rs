@@ -1,5 +1,6 @@
 //! Audio-block packing, frame padding and CRC2.
 
+use crate::aht_tables::BITS_VS_HEBAP;
 use crate::analysis::EXPONENT_GROUP_TAB;
 use crate::bitwriter::BitWriter;
 use crate::encoder::{FrameEncoder, coded_channel_order};
@@ -110,6 +111,26 @@ pub(crate) fn write_audio_block(enc: &FrameEncoder, blk: usize, w: &mut BitWrite
 
     let (order, count) = coded_channel_order(cfg, block);
     for &ch in &order[..count] {
+        if enc.aht_channels[ch] {
+            if blk == 0 {
+                w.write(2, 0); // no GAQ
+                for i in cfg.start_freq[ch]..block.end_freq[ch] {
+                    let hebap = block.bap[ch][i] as usize;
+                    if hebap == 0 {
+                        continue;
+                    }
+                    let bits = BITS_VS_HEBAP[hebap] as u32;
+                    if hebap < 8 {
+                        w.write(bits, enc.aht_vq[ch][i] as u32);
+                    } else {
+                        for value in enc.aht_quant[ch][i] {
+                            w.write_signed(bits, value);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         for i in cfg.start_freq[ch]..block.end_freq[ch] {
             let q = block.qmant[ch][i];
             let b = block.bap[ch][i];

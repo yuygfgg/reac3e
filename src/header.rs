@@ -11,6 +11,7 @@ pub(crate) fn write_frame_header(enc: &FrameEncoder, w: &mut BitWriter) {
     write_frame_flags(enc, w);
     write_coupling_strategy(enc, w);
     write_exponent_strategies(enc, w);
+    write_aht_info(enc, w);
     write_snr_offsets(enc, w);
 }
 
@@ -101,7 +102,7 @@ fn write_frame_flags(enc: &FrameEncoder, w: &mut BitWriter) {
 
     if cfg.num_blocks == 6 {
         w.write_bool(!enc.use_frame_exp_strategy);
-        w.write_bool(false); // AHT disabled
+        w.write_bool(enc.aht_used);
     }
     w.write(2, 0); // SNR offset strategy
     w.write_bool(false); // transient pre-noise disabled
@@ -162,6 +163,19 @@ fn write_exponent_strategies(enc: &FrameEncoder, w: &mut BitWriter) {
                 0
             };
             w.write(5, value);
+        }
+    }
+}
+
+fn write_aht_info(enc: &FrameEncoder, w: &mut BitWriter) {
+    if !enc.aht_used {
+        return;
+    }
+    let num_cpl_blocks = enc.blocks.iter().filter(|block| block.cpl_in_use).count();
+    let start = usize::from(num_cpl_blocks != enc.cfg.num_blocks);
+    for ch in start..=enc.cfg.channels {
+        if enc.aht_eligible(ch) {
+            w.write_bool(enc.aht_channels[ch]);
         }
     }
 }

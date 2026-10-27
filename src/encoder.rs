@@ -1,5 +1,7 @@
 //! Frame/stream encoder orchestration.
 
+use crate::aht;
+use crate::aht_tables::{BITS_VS_HEBAP, HEBAP_TAB};
 use crate::alloc;
 use crate::analysis::{
     self, BitAllocParameters, EXPONENT_GROUP_TAB, ExpStrategy, encode_exponents_blk_ch,
@@ -17,7 +19,7 @@ use crate::quantize::{self, MantCounts};
 use crate::rematrix;
 use crate::tables::{
     AC3_BLOCK_SIZE, AC3_CHMODE_2F2R, AC3_CHMODE_MONO, AC3_CHMODE_STEREO, AC3_MAX_BLOCKS,
-    AC3_MAX_CHANNELS, AC3_MAX_COEFS, EAC3_FRM_EXPSTR, FAST_GAIN_TAB,
+    AC3_MAX_CHANNELS, AC3_MAX_COEFS, BAP_TAB, EAC3_FRM_EXPSTR, FAST_GAIN_TAB,
 };
 use crate::transient::TransientDetector;
 
@@ -239,6 +241,12 @@ pub struct FrameEncoder {
     pub(crate) fine_snr_offset: [u8; CH],
     pub(crate) frame_bits_fixed: i32,
     pub(crate) frame_size: usize,
+    pub(crate) aht_enabled: bool,
+    pub(crate) aht_used: bool,
+    pub(crate) aht_channels: [bool; CH],
+    pub(crate) aht_coef: [[[f64; 6]; AC3_MAX_COEFS]; CH],
+    pub(crate) aht_vq: [[u16; AC3_MAX_COEFS]; CH],
+    pub(crate) aht_quant: [[[i32; 6]; AC3_MAX_COEFS]; CH],
     budget: FrameBudget,
     pub(crate) frame_index: u64,
     final_frame_seen: bool,
@@ -274,6 +282,12 @@ impl FrameEncoder {
             coarse_snr_offset: 40,
             fine_snr_offset: [0; CH],
             frame_bits_fixed,
+            aht_enabled: false,
+            aht_used: false,
+            aht_channels: [false; CH],
+            aht_coef: [[[0.0; 6]; AC3_MAX_COEFS]; CH],
+            aht_vq: [[0; AC3_MAX_COEFS]; CH],
+            aht_quant: [[[0; 6]; AC3_MAX_COEFS]; CH],
             budget: FrameBudget::default(),
             frame_index: 0,
             final_frame_seen: false,
@@ -287,6 +301,11 @@ impl FrameEncoder {
     /// Enable or disable block switching (enabled by default).
     pub fn set_block_switch(&mut self, enabled: bool) {
         self.block_switch = enabled;
+    }
+
+    /// Enable or disable the experimental AHT path.
+    pub fn set_aht_enabled(&mut self, enabled: bool) {
+        self.aht_enabled = enabled;
     }
 
     /// Samples represented by one syncframe (1536 for six blocks).
@@ -435,6 +454,9 @@ impl FrameEncoder {
         // --- exponents ---
         self.extract_exponents();
         self.compute_exp_strategy();
+        if self.aht_enabled {
+            self.prepare_aht();
+        }
         self.encode_exponents();
 
         // --- bit allocation ---
@@ -442,6 +464,7 @@ impl FrameEncoder {
 
         // --- grouped exponents, quantisation, packing ---
         self.group_exponents();
+        self.quantize_aht();
         self.quantize_mantissas();
 
         let mut w = BitWriter::with_capacity(self.frame_size);
@@ -559,6 +582,106 @@ impl FrameEncoder {
         self.use_frame_exp_strategy = true;
     }
 
+    fn prepare_aht(&mut self) {
+        self.aht_used = false;
+        self.aht_channels = [false; CH];
+        if self.cfg.num_blocks != 6 || self.blk_sw_syntax {
+            return;
+        }
+
+        let first_ch = usize::from(!self.cpl_on);
+        for ch in first_ch..=self.cfg.fbw_channels {
+            if self.cfg.lfe_on && ch == self.cfg.lfe_channel {
+                continue;
+            }
+            let in_cpl = self.blocks[0].channel_in_cpl[ch];
+            let end = self.blocks[0].end_freq[ch];
+            if self
+                .blocks
+                .iter()
+                .any(|block| block.channel_in_cpl[ch] != in_cpl || block.end_freq[ch] != end)
+            {
+                continue;
+            }
+            let start = self.cfg.start_freq[ch];
+            if start >= end {
+                continue;
+            }
+            let mut exponents = [0u8; AC3_MAX_COEFS];
+            let mut ok = true;
+            let mut dc_energy = 0.0f64;
+            let mut total_energy = 0.0f64;
+            for (bin, exponent_slot) in exponents.iter_mut().enumerate().take(end).skip(start) {
+                let mut input = [0.0f64; 6];
+                for (blk, value) in input.iter_mut().enumerate() {
+                    *value = self.blocks[blk].fixed_coef[ch][bin] as f64;
+                }
+                let aht = aht::forward(&input);
+                dc_energy += aht[0] * aht[0];
+                for value in aht {
+                    total_energy += value * value;
+                }
+                let max_abs = aht
+                    .iter()
+                    .fold(0.0f64, |maximum, value| maximum.max(value.abs()));
+                let exponent = if max_abs < 1.0 {
+                    24
+                } else {
+                    23 - max_abs.log2().floor() as i32
+                };
+                if bin == start && exponent > 15 {
+                    ok = false;
+                    break;
+                }
+                *exponent_slot = exponent.clamp(0, 24) as u8;
+                self.aht_coef[ch][bin] = aht;
+            }
+            if !ok || total_energy <= 0.0 || dc_energy / total_energy < 0.1 {
+                continue;
+            }
+
+            for block in &mut self.blocks {
+                block.exp[ch][start..end].copy_from_slice(&exponents[start..end]);
+            }
+            self.exp_strategy[ch][0] = D15;
+            for blk in 1..self.cfg.num_blocks {
+                self.exp_strategy[ch][blk] = ExpStrategy::Reuse;
+            }
+            self.aht_channels[ch] = true;
+            self.aht_used = true;
+        }
+
+        if self.aht_used {
+            self.get_frame_exp_strategy();
+        }
+    }
+
+    /// Quantise the transformed AHT coefficients once the final bit
+    /// allocation (hebap) is known.
+    fn quantize_aht(&mut self) {
+        let first_ch = usize::from(!self.cpl_on);
+        for ch in first_ch..=self.cfg.fbw_channels {
+            if !self.aht_channels[ch] {
+                continue;
+            }
+            let start = self.cfg.start_freq[ch];
+            let end = self.blocks[0].end_freq[ch];
+            for bin in start..end {
+                let hebap = self.bap_work[0][ch][bin];
+                self.blocks[0].bap[ch][bin] = hebap;
+                let exponent = self.blocks[0].exp[ch][bin] as i32;
+                let scale = 2f64.powi(exponent - 1);
+                let mut target = [0.0f64; 6];
+                for (target, value) in target.iter_mut().zip(self.aht_coef[ch][bin]) {
+                    *target = value * scale;
+                }
+                let (vq, mantissa) = aht::quantise(hebap, &target);
+                self.aht_vq[ch][bin] = vq;
+                self.aht_quant[ch][bin] = mantissa;
+            }
+        }
+    }
+
     fn encode_exponents(&mut self) {
         let start = usize::from(!self.cpl_on);
         for ch in start..=self.cfg.channels {
@@ -643,6 +766,11 @@ impl FrameEncoder {
                 if self.exp_strategy[ch][blk].is_reuse() {
                     continue;
                 }
+                let table = if self.aht_channels[ch] {
+                    &HEBAP_TAB
+                } else {
+                    &BAP_TAB
+                };
                 alloc::calc_bap(
                     &block.mask[ch],
                     &block.psd[ch],
@@ -650,6 +778,7 @@ impl FrameEncoder {
                     block.end_freq[ch],
                     snr_offset,
                     floor,
+                    table,
                     &mut self.bap_work[blk][ch],
                 );
             }
@@ -675,9 +804,23 @@ impl FrameEncoder {
         alloc::count_mantissa_bits_init(&mut mant_cnt);
         let max_end_freq = self.cfg.bandwidth_code * 3 + 73;
         let start_ch = usize::from(!self.cfg.cpl_enabled);
+        let mut aht_bits = 0usize;
         for (blk, block) in self.blocks.iter().enumerate() {
             for ch in start_ch..=self.cfg.channels {
                 if ch == 0 && !block.cpl_in_use {
+                    continue;
+                }
+                if self.aht_channels[ch] {
+                    if blk == 0 {
+                        for bin in self.cfg.start_freq[ch]..block.end_freq[ch] {
+                            let hebap = self.bap_work[0][ch][bin] as usize;
+                            if hebap == 0 {
+                                continue;
+                            }
+                            let bits = BITS_VS_HEBAP[hebap] as usize;
+                            aht_bits += if hebap < 8 { bits } else { bits * 6 };
+                        }
+                    }
                     continue;
                 }
                 let start = self.cfg.start_freq[ch];
@@ -686,7 +829,7 @@ impl FrameEncoder {
                 alloc::update_bap_counts(&mut mant_cnt[blk], &self.bap_work[blk][ch][start..], len);
             }
         }
-        alloc::compute_mantissa_size(&mant_cnt)
+        aht_bits + alloc::compute_mantissa_size(&mant_cnt)
     }
 
     fn bit_alloc_masking(&mut self) {
@@ -751,10 +894,34 @@ impl FrameEncoder {
         let mut bits = count_metadata_bits(&self.cfg.metadata, &self.cfg);
         bits += self.count_coupling_strategy_bits();
         bits += self.count_coupling_exponent_bits();
+        bits += self.count_aht_bits();
         for (blk, block) in self.blocks.iter().enumerate() {
             bits += self.count_audio_block_bits(blk, block);
         }
         bits
+    }
+
+    pub(crate) fn aht_eligible(&self, ch: usize) -> bool {
+        for blk in 1..self.cfg.num_blocks {
+            if !self.exp_strategy[ch][blk].is_reuse() {
+                return false;
+            }
+            if ch == 0 && self.blocks[blk].new_cpl_strategy {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn count_aht_bits(&self) -> i32 {
+        if !self.aht_used {
+            return 0;
+        }
+        let num_cpl_blocks = self.blocks.iter().filter(|block| block.cpl_in_use).count();
+        let start = usize::from(num_cpl_blocks != self.cfg.num_blocks);
+        (start..=self.cfg.channels)
+            .filter(|&ch| self.aht_eligible(ch))
+            .count() as i32
     }
 
     /// Flag bits that describe where coupling starts and stops.
@@ -842,6 +1009,9 @@ impl FrameEncoder {
                 }
                 bits += 2;
             }
+            if blk == 0 && self.aht_channels[ch] {
+                bits += 2; // gaq_mode
+            }
         }
 
         if block.cpl_in_use {
@@ -900,6 +1070,9 @@ impl FrameEncoder {
             let mut qmant = [0i16; CH * quantize::QSTRIDE];
 
             for &ch in &order[..count] {
+                if self.aht_channels[ch] {
+                    continue;
+                }
                 let reference = self.exp_ref_block[ch][blk] as usize;
                 quantize::quantize_mantissas_blk_ch(
                     &mut counters,
@@ -1026,6 +1199,11 @@ impl StreamEncoder {
     /// Enable or disable block switching.
     pub fn set_block_switch(&mut self, enabled: bool) {
         self.encoder.set_block_switch(enabled);
+    }
+
+    /// Enable or disable the experimental AHT path.
+    pub fn set_aht_enabled(&mut self, enabled: bool) {
+        self.encoder.set_aht_enabled(enabled);
     }
 
     /// Actual coded bandwidth cutoff in Hz.

@@ -15,6 +15,8 @@
 
 #![forbid(unsafe_code)]
 
+mod aht;
+mod aht_tables;
 mod alloc;
 mod analysis;
 mod bitwriter;

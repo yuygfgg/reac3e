@@ -72,6 +72,10 @@ struct Cli {
     #[arg(long)]
     no_block_switch: bool,
 
+    /// Enable the experimental AHT (adaptive hybrid transform) path.
+    #[arg(long)]
+    aht: bool,
+
     /// Override the coded bandwidth cutoff in Hz (default: automatic).
     #[arg(long, value_name = "HZ")]
     cutoff_hz: Option<u32>,
@@ -197,6 +201,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
 
     let mut encoder = StreamEncoder::new(config)?;
     encoder.set_block_switch(!cli.no_block_switch);
+    if cli.aht {
+        encoder.set_aht_enabled(true);
+    }
     let mut output = open_output(&cli.output)?;
     let chunk_samples = 4096 * channels;
     let mut syncframes = 0u64;
