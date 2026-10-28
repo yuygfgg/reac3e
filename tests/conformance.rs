@@ -165,3 +165,41 @@ fn surround_50_no_lfe() {
         false,
     ));
 }
+
+#[test]
+fn short_windows_do_not_add_a_click_to_a_transient() {
+    let case = case(
+        "stereo64_transient",
+        Acmod::Stereo,
+        false,
+        ffmpeg::ChannelLayout::STEREO,
+        64_000,
+        Coupling::Off,
+        true,
+    );
+    let event_start = 24_576;
+    let mut pcm = vec![0.0f32; case.samples * case.channels()];
+    for channel in 0..case.channels() {
+        for offset in 0..128 {
+            let envelope = (-(offset as f64) / 32.0).exp();
+            let phase = 2.0 * std::f64::consts::PI * 6_000.0 * offset as f64 / 48_000.0;
+            pcm[(event_start + offset) * case.channels() + channel] =
+                (0.8 * envelope * phase.sin()) as f32;
+        }
+    }
+
+    let switched = stream_bytes(encode_ours(&case, &pcm, &BsiMetadata::default()));
+    let decoded = decode(&switched, case.channels());
+    let max_step = decoded
+        .chunks_exact(case.channels())
+        .zip(decoded[case.channels()..].chunks_exact(case.channels()))
+        .flat_map(|(previous, current)| {
+            previous
+                .iter()
+                .zip(current)
+                .map(|(&previous, &current)| (current - previous).abs())
+        })
+        .fold(0.0f32, f32::max);
+
+    assert!(max_step < 1.25, "transient step reached {max_step:.3}");
+}

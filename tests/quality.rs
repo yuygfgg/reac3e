@@ -10,8 +10,8 @@
 //! 3. The same relative gate per channel, so a single-channel regression
 //!    cannot hide behind the mean.
 //!
-//! Requires Python 3 with the official `visqol-python` package:
-//! `python3 -m pip install 'visqol-python[accel,fftw]'`.
+//! Requires Python 3 with the `zimtohrli` package:
+//! `python3 -m pip install zimtohrli`.
 
 mod common;
 
@@ -25,11 +25,11 @@ use common::{Case, decode, encode_ours, encode_reference, init_ffmpeg, stream_by
 use ffmpeg_next as ffmpeg;
 use reac3e::{Acmod, BsiMetadata, Coupling};
 
-/// The candidate may trail FFmpeg by this much MOS-LQO before the gate fails.
+/// The candidate may trail FFmpeg by this much MOS before the gate fails.
 const MOS_MARGIN: f64 = 0.10;
 
-/// Identity ceiling of the audio-mode SVR is about 4.73.
-const TRANSPARENT: f64 = 4.60;
+/// Zimtohrli MOS at or above this is treated as transparent.
+const TRANSPARENT: f64 = 4.55;
 
 struct ChannelScores {
     per_channel: Vec<f64>,
@@ -61,8 +61,8 @@ fn gen_material(case: &Case, transients: bool) -> Vec<f32> {
     let mut state = 0xC0FF_EE11u32;
     let mut low = vec![0.0f64; channels];
 
-    // Non-periodic transients: a periodic click train makes ViSQOL's global
-    // alignment lock onto the wrong period and reports a false quality loss.
+    // Non-periodic transients: a periodic click train can make perceptual
+    // metrics lock onto the wrong period and report a false quality loss.
     let mut events = vec![Vec::new(); channels];
     for (ch, channel_events) in events.iter_mut().enumerate() {
         let mut seed = state ^ (ch as u32).wrapping_mul(0x9E37_79B9);
@@ -179,10 +179,9 @@ fn temp_dir() -> PathBuf {
     path
 }
 
-/// Score candidate and FFmpeg PCM against the reference with the official
-/// ViSQOL Python implementation.  Both candidates are scored in one helper
-/// process to amortize Python startup.
-fn visqol_pair(
+/// Score candidate and FFmpeg PCM against the reference with Zimtohrli.
+/// Both candidates are scored in one helper process to amortize Python startup.
+fn zimtohrli_pair(
     reference: &[f32],
     ours: &[f32],
     ffmpeg: &[f32],
@@ -228,37 +227,37 @@ fn visqol_pair(
         arguments.push(ffmpeg_paths[channel].clone());
     }
 
-    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/visqol_scores.py");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/zimtohrli_scores.py");
     let python = std::env::var_os("PYTHON").unwrap_or_else(|| "python3".into());
     let output = Command::new(python)
         .arg(script)
         .args(&arguments)
         .output()
-        .unwrap_or_else(|error| panic!("failed to run Python for ViSQOL: {error}"));
+        .unwrap_or_else(|error| panic!("failed to run Python for Zimtohrli: {error}"));
     fs::remove_dir_all(&directory).ok();
 
     if !output.status.success() {
         panic!(
-            "official ViSQOL failed:\n{}",
+            "Zimtohrli failed:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
 
-    let stdout = String::from_utf8(output.stdout).expect("ViSQOL output is not UTF-8");
+    let stdout = String::from_utf8(output.stdout).expect("Zimtohrli output is not UTF-8");
     let mut scores = Vec::with_capacity(channels * 2);
     for line in stdout.lines() {
-        let mut fields = line.split_whitespace();
-        let mos = fields
+        let score = line
+            .split_whitespace()
             .next()
-            .unwrap_or_else(|| panic!("malformed ViSQOL output:\n{stdout}"))
+            .unwrap_or_else(|| panic!("malformed Zimtohrli output:\n{stdout}"))
             .parse::<f64>()
-            .unwrap_or_else(|_| panic!("malformed ViSQOL output:\n{stdout}"));
-        scores.push(mos);
+            .unwrap_or_else(|_| panic!("malformed Zimtohrli output:\n{stdout}"));
+        scores.push(score);
     }
     assert_eq!(
         scores.len(),
         channels * 2,
-        "unexpected ViSQOL output:\n{stdout}"
+        "unexpected Zimtohrli output:\n{stdout}"
     );
 
     (
@@ -279,7 +278,7 @@ fn run_case(case: Case, floor: f64, generate: fn(&Case) -> Vec<f32>) {
     let ours_pcm = decode(&ours, case.channels());
     let ref_pcm = decode(&reference, case.channels());
 
-    let (ours_mos, ref_mos) = visqol_pair(&pcm, &ours_pcm, &ref_pcm, case.channels());
+    let (ours_mos, ref_mos) = zimtohrli_pair(&pcm, &ours_pcm, &ref_pcm, case.channels());
 
     eprintln!(
         "{}: ours {:.4} (min {:.4})  ffmpeg {:.4} (min {:.4})  delta {:+.4}  ours per-channel [{}]",
@@ -363,7 +362,7 @@ fn stereo_192k_matches_ffmpeg_quality() {
             rematrix: true,
             samples: 96_000,
         },
-        3.35,
+        4.25,
         gen_program,
     );
 }
@@ -381,7 +380,7 @@ fn surround_51_640k_matches_ffmpeg_quality() {
             rematrix: false,
             samples: 96_000,
         },
-        3.75,
+        4.40,
         gen_program,
     );
 }
@@ -399,7 +398,7 @@ fn surround_51_448k_coupling_off_matches_ffmpeg_quality() {
             rematrix: false,
             samples: 96_000,
         },
-        3.50,
+        4.33,
         gen_program,
     );
 }

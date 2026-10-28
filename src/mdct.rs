@@ -116,12 +116,7 @@ impl Mdct {
         }
     }
 
-    /// Transform a block-switched (short) block.
-    ///
-    /// `first` and `second` are the two windowed halves of the ordinary
-    /// 512-sample analysis window.  Their 128 coefficients each are
-    /// interleaved in the output exactly as the E-AC-3 short-block syntax
-    /// expects.
+    /// Transform both windowed halves with the alpha=-1 and alpha=+1 phases.
     pub(crate) fn process_short(&mut self, first: &[f32], second: &[f32], out: &mut [f32]) {
         debug_assert_eq!(first.len(), AC3_BLOCK_SIZE);
         debug_assert_eq!(second.len(), AC3_BLOCK_SIZE);
@@ -180,8 +175,8 @@ mod tests {
     fn short_pair_matches_direct_cosine_sums() {
         let mut mdct = Mdct::new();
         let mut state = 0x89ab_cdefu32;
-        let mut first = [0.0f32; 256];
-        let mut second = [0.0f32; 256];
+        let mut first = [0.0f32; AC3_BLOCK_SIZE];
+        let mut second = [0.0f32; AC3_BLOCK_SIZE];
         for (a, b) in first.iter_mut().zip(second.iter_mut()) {
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             *a = ((state >> 8) as f32 / (1u32 << 24) as f32) - 0.5;

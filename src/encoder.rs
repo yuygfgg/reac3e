@@ -377,23 +377,11 @@ impl FrameEncoder {
             let switch_allowed = self.block_switch
                 && self.cfg.bit_rate / self.cfg.channels as u32 <= BLOCK_SWITCH_MAX_BPS_PER_CHANNEL;
             if switch_allowed && ch <= self.cfg.fbw_channels {
-                // Once an onset switches the channel, keep the rest of the
-                // frame short.  The decay/reverb tail is part of the same
-                // transient event; returning to a long block immediately
-                // reintroduces pre-echo on the following block.  Measured on
-                // real transient material this is consistently better than a
-                // one- or two-block hold.
-                let mut hold_to_frame_end = false;
                 for blk in 0..num_blocks {
                     let start = AC3_BLOCK_SIZE + blk * AC3_BLOCK_SIZE;
                     let segment = &input[start..start + AC3_BLOCK_SIZE];
-                    if self.transient[ch].detect(segment) {
-                        hold_to_frame_end = true;
-                    }
-                    if hold_to_frame_end {
-                        self.blksw[ch][blk] = true;
-                        any_switched = true;
-                    }
+                    self.blksw[ch][blk] = self.transient[ch].detect(segment);
+                    any_switched |= self.blksw[ch][blk];
                 }
             }
 
@@ -1321,6 +1309,45 @@ mod tests {
 
         let (order, count) = coded_channel_order(&cfg, &block);
         assert_eq!(&order[..count], &[1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn transient_sets_short_block_flags() {
+        let config = EncoderConfig {
+            layout: ChannelLayout {
+                acmod: Acmod::Stereo,
+                lfe: false,
+            },
+            bitrate_bps: 64_000,
+            dialnorm: -27,
+            metadata: Default::default(),
+            coupling: Coupling::Off,
+            stereo_rematrixing: false,
+            cutoff_hz: None,
+        };
+        let mut encoder = FrameEncoder::new(config).unwrap();
+        let silence = vec![0.0f32; encoder.samples_per_frame()];
+        let silent_channels = [&silence[..], &silence[..]];
+        encoder
+            .encode_frame(&PlanarFrame::new(&silent_channels, ChannelOrder::Smpte))
+            .unwrap();
+
+        let mut transient = vec![0.0f32; encoder.samples_per_frame()];
+        for (offset, sample) in transient.iter_mut().take(128).enumerate() {
+            let envelope = (-(offset as f64) / 32.0).exp();
+            let phase = 2.0 * std::f64::consts::PI * 6_000.0 * offset as f64 / 48_000.0;
+            *sample = (0.8 * envelope * phase.sin()) as f32;
+        }
+        let transient_channels = [&transient[..], &transient[..]];
+        encoder
+            .encode_frame(&PlanarFrame::new(&transient_channels, ChannelOrder::Smpte))
+            .unwrap();
+
+        assert!(encoder.blk_sw_syntax);
+        assert!(encoder.blksw[1][0]);
+        assert!(encoder.blksw[2][0]);
+        assert!(!encoder.blksw[1][1]);
+        assert!(!encoder.blksw[2][1]);
     }
 
     #[test]

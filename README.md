@@ -114,6 +114,20 @@ cat reference.wav | python3 tools/measure_visqol.py - encoded.ec3
 The mean, minimum and per-channel MOS-LQO scores (plus VNSIM) are printed
 to stdout; `--quiet` suppresses the per-channel progress lines on stderr.
 
+### Zimtohrli measurement
+
+`tools/measure_zimtohrli.py` measures Zimtohrli distance and MOS using the
+[`zimtohrli`](https://pypi.org/project/zimtohrli/) package. Lower distance is
+better; the MOS is an approximation derived from it.
+
+```sh
+python3 -m pip install zimtohrli soundfile numpy
+
+python3 tools/measure_zimtohrli.py reference.wav encoded.ec3
+python3 tools/measure_zimtohrli.py reference.flac encoded.mp3
+cat reference.wav | python3 tools/measure_zimtohrli.py - encoded.ec3
+```
+
 ## Channel orders
 
 - `ChannelOrder::Smpte`: `L R C LFE Ls Rs` for 5.1, with the LFE placed after
@@ -134,16 +148,16 @@ when the bitstream legitimately diverges.
 ### Perceptual quality
 
 `tests/quality.rs` scores both the candidate and the FFmpeg reference against
-the original PCM with the official ViSQOL implementation, through
-`tests/visqol_scores.py`. Install it first:
+the original PCM with Zimtohrli, through `tests/zimtohrli_scores.py`. Install it
+first:
 
 ```sh
-python3 -m pip install 'visqol-python[accel,fftw]'
+python3 -m pip install zimtohrli
 ```
 
 Set `PYTHON` to use a specific interpreter. Each case checks:
 
-- an absolute MOS-LQO floor
+- an absolute Zimtohrli MOS floor
 - mean and per-channel MOS within `MOS_MARGIN` of the FFmpeg reference
 
 ```sh
