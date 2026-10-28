@@ -1273,6 +1273,7 @@ mod tests {
             coupling,
             stereo_rematrixing: false,
             cutoff_hz: None,
+            coupling_start: None,
         }
         .validate()
         .unwrap()
@@ -1324,6 +1325,7 @@ mod tests {
             coupling: Coupling::Off,
             stereo_rematrixing: false,
             cutoff_hz: None,
+            coupling_start: None,
         };
         let mut encoder = FrameEncoder::new(config).unwrap();
         let silence = vec![0.0f32; encoder.samples_per_frame()];

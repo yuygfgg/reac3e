@@ -478,6 +478,7 @@ mod tests {
             coupling: Coupling::Auto,
             stereo_rematrixing: false,
             cutoff_hz: None,
+            coupling_start: None,
         }
         .validate()
         .unwrap()

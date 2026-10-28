@@ -19,9 +19,7 @@ Supported:
 - CBR
 - block switching with the A/52 transient detector; enabled by default at up
   to 64 kbps per channel and disabled with `--no-block-switch`
-- low-rate bandwidth flooring so E-AC-3 does not collapse to a 6.8 kHz
-  high-frequency limit at 96 kbps stereo
-- channel coupling (auto / on / off)
+- channel coupling (auto / on / off / start band 0..=15)
 - stereo rematrixing
 - AHT (adaptive hybrid transform) for stationary frames (experimental, `--aht`)
 - the BSI metadata fields that the E-AC-3 syntax exposes (dialnorm, mixing and
@@ -50,6 +48,7 @@ let cfg = EncoderConfig {
     dialnorm: -27,
     metadata: BsiMetadata::default(),
     coupling: Coupling::Auto,
+    coupling_start: None,
     stereo_rematrixing: true,
     cutoff_hz: None,
 };
@@ -92,11 +91,14 @@ cargo run --release --example reac3e -- input.wav output.ec3 --layout 5.1 -b 448
 Input channel counts of 1, 2, 3, 4, 5 and 6 map to mono, stereo, 3.0, 4.0,
 5.0 and 5.1 respectively; use `--layout` to select another supported AC-3
 layout (for example `2.1`, `3.1` or `4.1`). Channels are expected in WAVE
-order. `--dialnorm`, `--coupling`, `--no-rematrixing`, `--no-block-switch`,
-`--aht`, `--cutoff-hz` and `--quiet` expose the remaining encoder options.  The
-bandwidth cutoff defaults to a bitrate-dependent table; `--cutoff-hz` overrides
-it (the nearest representable E-AC-3 bandwidth code is used). Use `--help` for the full
-list. The output is raw E-AC-3 syncframes, not a container format.
+order. `--dialnorm`, `--coupling`, `--coupling-start`, `--no-rematrixing`,
+`--no-block-switch`, `--aht`, `--cutoff-hz` and `--quiet` expose the remaining
+encoder options.  The bandwidth cutoff defaults to a bitrate-dependent table;
+`--cutoff-hz` overrides it (the nearest representable E-AC-3 bandwidth code is
+used). `--coupling-start` overrides the coupling start band (0..=15), which is
+roughly 3.5 kHz plus 1.125 kHz per band. Use
+`--help` for the full list. The output is raw E-AC-3 syncframes, not a
+container format.
 
 ### ViSQOL measurement
 

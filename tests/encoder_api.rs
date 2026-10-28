@@ -20,6 +20,7 @@ fn config(
         coupling,
         stereo_rematrixing,
         cutoff_hz: None,
+        coupling_start: None,
     }
 }
 

@@ -211,6 +211,13 @@ pub struct EncoderConfig {
     pub dialnorm: i8,
     pub metadata: BsiMetadata,
     pub coupling: Coupling,
+    /// Override the coupling start band (0..=15).
+    ///
+    /// The coupling channel starts at MDCT bin `band * 12 + 37`, roughly
+    /// `3.5 kHz + band * 1.125 kHz`.  `None` uses the bitrate table.  Raising
+    /// the start keeps more high-frequency content out of the shared coupling
+    /// channel, which preserves stereo width; band 0 starts near 3.5 kHz.
+    pub coupling_start: Option<u8>,
     pub stereo_rematrixing: bool,
     /// Override the coded bandwidth cutoff in Hz.
     ///
@@ -397,18 +404,22 @@ fn coupling_layout(
     channel_mode: u8,
     bandwidth_code: usize,
     bitrate_code: usize,
+    start_override: Option<u8>,
 ) -> CouplingLayout {
     if channel_mode < AC3_CHMODE_STEREO {
         return CouplingLayout::DISABLED;
     }
 
     let table_start = COUPLING_START_TAB[(channel_mode - 2) as usize][0][bitrate_code];
-    let mut start = match (coupling, table_start) {
-        (Coupling::Off, _) => return CouplingLayout::DISABLED,
-        (Coupling::Auto, start) if start < 0 => return CouplingLayout::DISABLED,
-        (Coupling::Auto, start) => start as i32,
-        (Coupling::On, start) if start < 0 => 15,
-        (Coupling::On, start) => start as i32,
+    let mut start = match coupling {
+        Coupling::Off => return CouplingLayout::DISABLED,
+        // An explicit start band enables coupling even when the automatic
+        // table would disable it.
+        Coupling::Auto if table_start < 0 && start_override.is_none() => {
+            return CouplingLayout::DISABLED;
+        }
+        _ if table_start < 0 => 15,
+        _ => table_start as i32,
     };
 
     // The reference coupling-start table is conservative for 5.1 at
@@ -416,11 +427,15 @@ fn coupling_layout(
     // both ViSQOL and segmental SNR on real 5.1 downmixes.  Explicit `On`
     // keeps the reference start so callers can still request the old
     // behaviour.
-    if channel_mode == Acmod::ThreeTwo.channel_mode()
+    if start_override.is_none()
+        && channel_mode == Acmod::ThreeTwo.channel_mode()
         && coupling == Coupling::Auto
         && (12..=16).contains(&bitrate_code)
     {
         start = start.min(6);
+    }
+    if let Some(band) = start_override {
+        start = band as i32;
     }
 
     let end_band = bandwidth_code / 4 + 3;
@@ -490,6 +505,11 @@ impl EncoderConfig {
         if self.bitrate_bps == 0 {
             return Err(EncodeError::Config("bitrate must be non-zero".into()));
         }
+        if self.coupling_start.is_some_and(|band| band > 15) {
+            return Err(EncodeError::Config(
+                "coupling start band must be between 0 and 15".into(),
+            ));
+        }
         if fbw_channels == 0 {
             return Err(EncodeError::Config(
                 "layout has no fullband channels".into(),
@@ -543,7 +563,13 @@ impl EncoderConfig {
             }
             code
         };
-        let coupling = coupling_layout(self.coupling, channel_mode, bandwidth_code, bitrate_code);
+        let coupling = coupling_layout(
+            self.coupling,
+            channel_mode,
+            bandwidth_code,
+            bitrate_code,
+            self.coupling_start,
+        );
 
         let mut start_freq = [0usize; 8];
         if coupling.enabled {
@@ -691,6 +717,7 @@ mod tests {
             coupling,
             stereo_rematrixing: true,
             cutoff_hz: None,
+            coupling_start: None,
         }
         .validate()
         .unwrap()
@@ -781,12 +808,77 @@ mod tests {
             coupling: Coupling::Auto,
             stereo_rematrixing: true,
             cutoff_hz: Some(15_000),
+            coupling_start: None,
         }
         .validate()
         .unwrap();
 
         assert_eq!(cfg.bandwidth_code, 29);
         assert!((cfg.cutoff_hz() - 15_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn coupling_start_override_replaces_the_automatic_band() {
+        let cfg = EncoderConfig {
+            layout: ChannelLayout {
+                acmod: Acmod::Stereo,
+                lfe: false,
+            },
+            bitrate_bps: 96_000,
+            dialnorm: -27,
+            metadata: BsiMetadata::default(),
+            coupling: Coupling::Auto,
+            coupling_start: Some(10),
+            stereo_rematrixing: true,
+            cutoff_hz: None,
+        }
+        .validate()
+        .unwrap();
+
+        assert!(cfg.cpl_enabled);
+        assert_eq!(cfg.cpl_start_freq, 10 * 12 + 37);
+    }
+
+    #[test]
+    fn coupling_start_override_enables_auto_coupling() {
+        let cfg = EncoderConfig {
+            layout: ChannelLayout {
+                acmod: Acmod::Stereo,
+                lfe: false,
+            },
+            bitrate_bps: 640_000,
+            dialnorm: -27,
+            metadata: BsiMetadata::default(),
+            coupling: Coupling::Auto,
+            coupling_start: Some(8),
+            stereo_rematrixing: true,
+            cutoff_hz: None,
+        }
+        .validate()
+        .unwrap();
+
+        assert!(cfg.cpl_enabled);
+        assert_eq!(cfg.cpl_start_freq, 8 * 12 + 37);
+    }
+
+    #[test]
+    fn coupling_start_override_is_range_checked() {
+        let result = EncoderConfig {
+            layout: ChannelLayout {
+                acmod: Acmod::Stereo,
+                lfe: false,
+            },
+            bitrate_bps: 96_000,
+            dialnorm: -27,
+            metadata: BsiMetadata::default(),
+            coupling: Coupling::Auto,
+            coupling_start: Some(16),
+            stereo_rematrixing: true,
+            cutoff_hz: None,
+        }
+        .validate();
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -824,6 +916,7 @@ mod tests {
             coupling: Coupling::Auto,
             stereo_rematrixing: false,
             cutoff_hz: None,
+            coupling_start: None,
         }
         .validate()
         .unwrap();

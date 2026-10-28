@@ -244,6 +244,7 @@ mod tests {
             coupling: Coupling::Auto,
             stereo_rematrixing: true,
             cutoff_hz: None,
+            coupling_start: None,
         });
         assert_eq!(&bytes[..2], &[0x0B, 0x77]);
     }
@@ -275,6 +276,7 @@ mod tests {
             coupling: Coupling::Auto,
             stereo_rematrixing: false,
             cutoff_hz: None,
+            coupling_start: None,
         });
 
         let mut bits = BitReader::new(&bytes);
@@ -328,6 +330,7 @@ mod tests {
             coupling: Coupling::Auto,
             stereo_rematrixing: true,
             cutoff_hz: None,
+            coupling_start: None,
         };
         let mut encoder = FrameEncoder::new(cfg).unwrap();
         assert_eq!(encoder.samples_per_frame(), 3 * 256);
@@ -372,6 +375,7 @@ mod tests {
             coupling: Coupling::Auto,
             stereo_rematrixing: false,
             cutoff_hz: None,
+            coupling_start: None,
         });
 
         let mut bits = BitReader::new(&bytes);

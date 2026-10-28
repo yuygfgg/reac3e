@@ -78,6 +78,7 @@ mod tests {
             coupling: crate::config::Coupling::Auto,
             stereo_rematrixing: true,
             cutoff_hz: None,
+            coupling_start: None,
         }
         .validate()
         .unwrap()

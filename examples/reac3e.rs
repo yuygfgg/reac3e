@@ -64,6 +64,13 @@ struct Cli {
     #[arg(short, long, value_enum, default_value_t = CouplingArg::Auto)]
     coupling: CouplingArg,
 
+    /// Override the coupling start band (0..=15; default: bitrate table).
+    ///
+    /// Higher bands keep more high-frequency content out of the coupling
+    /// channel, preserving stereo width. Band 0 starts near 3.5 kHz.
+    #[arg(long, value_name = "BAND", value_parser = clap::value_parser!(u8).range(0..=15))]
+    coupling_start: Option<u8>,
+
     /// Disable stereo rematrixing.
     #[arg(long)]
     no_rematrixing: bool,
@@ -195,6 +202,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         dialnorm: cli.dialnorm,
         metadata: BsiMetadata::default(),
         coupling: cli.coupling.into(),
+        coupling_start: cli.coupling_start,
         stereo_rematrixing: !cli.no_rematrixing,
         cutoff_hz: cli.cutoff_hz,
     };
@@ -246,6 +254,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             cli.coupling,
             encoder.cutoff_hz()
         );
+        if let Some(band) = cli.coupling_start {
+            eprintln!("coupling start band: {band}");
+        }
         eprintln!("output: {destination}, {syncframes} syncframes, {bytes_written} bytes");
     }
 

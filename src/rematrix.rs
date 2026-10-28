@@ -100,6 +100,7 @@ mod tests {
             coupling: Coupling::Off,
             stereo_rematrixing: true,
             cutoff_hz: None,
+            coupling_start: None,
         }
         .validate()
         .unwrap()
