@@ -7,7 +7,9 @@ use crate::encoder::{FrameEncoder, coded_channel_order};
 use crate::error::EncodeError;
 use crate::tables::{AC3_CHMODE_STEREO, BAP_BITS};
 
-pub(crate) fn write_audio_block(enc: &FrameEncoder, blk: usize, w: &mut BitWriter) {
+/// Write one audio block and return the bit position where its skip field
+/// begins (the position just after the mantissas).
+pub(crate) fn write_audio_block(enc: &FrameEncoder, blk: usize, w: &mut BitWriter) -> usize {
     let cfg = &enc.cfg;
     let block = &enc.blocks[blk];
 
@@ -109,6 +111,23 @@ pub(crate) fn write_audio_block(enc: &FrameEncoder, blk: usize, w: &mut BitWrite
         }
     }
 
+    // Skip field, before the mantissa data (A/52 E.3.4).  The frame-level
+    // `skipFieldSyntaxEnabled` flag is written by `header::write_frame_flags`.
+    let skip_point = w.bits_written();
+    if let Some(meta) = &enc.frame_meta
+        && !meta.emdf.is_empty()
+    {
+        if blk == meta.target_block {
+            w.write_bool(true); // skiple
+            w.write(9, meta.emdf.len() as u32); // skipl (bytes)
+            for &byte in &meta.emdf {
+                w.write(8, byte as u32);
+            }
+        } else {
+            w.write_bool(false); // skiple
+        }
+    }
+
     let (order, count) = coded_channel_order(cfg, block);
     for &ch in &order[..count] {
         if enc.aht_channels[ch] {
@@ -146,11 +165,12 @@ pub(crate) fn write_audio_block(enc: &FrameEncoder, blk: usize, w: &mut BitWrite
             }
         }
     }
+    skip_point
 }
 
 /// CRC-16/ANSI over E-AC-3 frame bytes, with the polynomial in the MSB-first
 /// representation used by the bitstream.
-pub(crate) fn crc16(data: &[u8]) -> u16 {
+pub fn crc16(data: &[u8]) -> u16 {
     let mut crc: u32 = 0;
     for &byte in data {
         for i in (0..8).rev() {

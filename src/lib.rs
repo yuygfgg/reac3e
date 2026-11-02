@@ -26,6 +26,7 @@ mod dsp;
 mod encoder;
 mod error;
 mod header;
+mod inject;
 mod kbd;
 mod mdct;
 mod pack;
@@ -40,6 +41,8 @@ pub use config::{
     DolbySurroundExMode, DolbySurroundMode, DownmixMode, EncoderConfig, RoomType, SAMPLE_RATE,
     ServiceType,
 };
-pub use encoder::{Frame, FrameEncoder, StreamEncoder};
+pub use encoder::{Frame, FrameEdits, FrameEncoder, SkipMetadata, StreamEncoder};
 pub use error::EncodeError;
+pub use inject::inject_metadata;
+pub use pack::crc16;
 pub use pcm::PlanarFrame;

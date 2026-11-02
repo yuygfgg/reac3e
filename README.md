@@ -68,6 +68,56 @@ For arbitrary chunk sizes, use `StreamEncoder::push_interleaved` and
 `StreamEncoder::finish`. Interleaved input is in SMPTE/WAVE order for the
 configured layout.
 
+### Atmos skip-field metadata
+
+`FrameEncoder::encode_frame_with_metadata` and
+`StreamEncoder::push_interleaved_with_metadata` write E-AC-3 `addbsi` and
+skip-field payloads natively:
+
+```rust
+use reac3e::{FrameEncoder, PlanarFrame, ChannelOrder, SkipMetadata};
+
+let meta = SkipMetadata::new(
+    &[0x01, 0x10],          // addbsi bytes (empty = no addbsi)
+    &[0x58, 0x38, 0xAA],    // EMDF container, carried in one block (empty = no skip field)
+    2,                      // target audio block (0-based)
+);
+let frame = enc.encode_frame_with_metadata(
+    &PlanarFrame::new(&channels, ChannelOrder::Smpte),
+    Some(meta),
+)?;
+# Ok::<(), reac3e::EncodeError>(())
+```
+
+- The audio is still allocated against the configured CBR core frame size.
+  `addbsi` and the skip field are appended, so the returned frame is larger by
+  the metadata overhead; the core bitrate is unchanged.
+- The metadata is written by the same packer that emits the audio blocks, so
+  every supported syntax works: any of the 1/2/3/6 block counts, block
+  switching, coupling, rematrixing and AHT.
+- Limits: `addbsi` is at most 64 bytes; EMDF is at most 511 bytes (`skipl` is
+  9 bits). An empty `addbsi` or `emdf` omits that field.
+- `Frame::edits` reports the exact bit positions of the `addbsie` flag, the
+  `skipFieldSyntaxEnabled` flag, each block's skip-field point and the first
+  EMDF byte, for signing or external inspection.
+- `tests/metadata.rs` round-trips every configuration through the FFmpeg
+  E-AC-3 decoder and asserts the decoded PCM is bit-identical to the plain
+  stream.
+
+For a two-pass pipeline (encode the core, decode/analyse it, then add
+metadata), use `reac3e::inject_metadata`:
+
+```rust
+let core = enc.encode_frame(&PlanarFrame::new(&channels, ChannelOrder::Smpte))?;
+// ... analyse/decode `core` to build the EMDF payload ...
+let tagged = reac3e::inject_metadata(&core, &meta)?;
+# Ok::<(), reac3e::EncodeError>(())
+```
+
+It inserts `addbsi` and the skip field at the bit positions recorded in
+`Frame::edits`, so it also supports every syntax without parsing the audio
+blocks.  It rejects a frame that already carries metadata.
+
 The encoder has a 256-sample overlap latency, reported by
 `FrameEncoder::latency`. The first frame is produced from the input samples
 with a zeroed history, matching the conventional E-AC-3 filterbank start-up.

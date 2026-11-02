@@ -45,6 +45,20 @@ impl BitWriter {
         self.write(n, value as u32);
     }
 
+    /// Number of bits written so far, including pending bits not yet flushed.
+    pub(crate) fn bits_written(&self) -> usize {
+        self.out.len() * 8 + self.nbits as usize
+    }
+
+    /// Copy `count` MSB-first bits from `source`, starting at `start_bit`.
+    pub(crate) fn copy_from(&mut self, source: &[u8], start_bit: usize, count: usize) {
+        for offset in 0..count {
+            let position = start_bit + offset;
+            let bit = (source[position / 8] >> (7 - (position % 8))) & 1;
+            self.write(1, u32::from(bit));
+        }
+    }
+
     /// Pad the current byte with zero bits.
     pub(crate) fn align(&mut self) {
         if self.nbits > 0 {

@@ -33,6 +33,44 @@ const EXP_DIFF_THRESHOLD: i32 = 500;
 /// above it the gain disappears and the coupling loss dominates.
 const BLOCK_SWITCH_MAX_BPS_PER_CHANNEL: u32 = 64_000;
 
+/// Largest syncframe: `frmsiz` is 11 bits and counts 16-bit words minus one.
+pub(crate) const MAX_FRAME_BYTES: usize = 4096;
+
+/// Validate a [`SkipMetadata`] for a frame with `num_blocks` audio blocks.
+pub(crate) fn validate_skip_metadata(
+    meta: &SkipMetadata,
+    num_blocks: usize,
+) -> Result<(), EncodeError> {
+    if meta.addbsi.len() > 64 {
+        return Err(EncodeError::Config(format!(
+            "addbsi is {} bytes; the length field allows at most 64",
+            meta.addbsi.len()
+        )));
+    }
+    if meta.emdf.len() > 511 {
+        return Err(EncodeError::Config(format!(
+            "EMDF is {} bytes; the 9-bit skip-field length allows at most 511",
+            meta.emdf.len()
+        )));
+    }
+    if meta.has_skip_field() && meta.target_block >= num_blocks {
+        return Err(EncodeError::Config(format!(
+            "target block {} is outside the {num_blocks} blocks of this frame",
+            meta.target_block
+        )));
+    }
+    Ok(())
+}
+
+/// Patch the 11-bit `frmsiz` field (bit 21) after the frame grew.
+pub(crate) fn patch_frame_size(bytes: &mut [u8], frame_size: usize) {
+    debug_assert!(bytes.len() >= 4);
+    debug_assert!((2..=MAX_FRAME_BYTES).contains(&frame_size));
+    let frmsiz = (frame_size / 2 - 1) as u32;
+    bytes[2] = (bytes[2] & 0xF8) | ((frmsiz >> 8) & 0x07) as u8;
+    bytes[3] = (frmsiz & 0xFF) as u8;
+}
+
 /// State of a coupling update flag in the E-AC-3 syntax.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CplFlag {
@@ -191,11 +229,84 @@ pub(crate) fn coded_channel_order(cfg: &ValidatedConfig, block: &Block) -> ([usi
     (order, count)
 }
 
+/// Atmos metadata embedded in an E-AC-3 frame's skip field.
+///
+/// Both payloads are written natively by the encoder, so every syntax reac3e
+/// supports (any block count, block switching, coupling, rematrixing, AHT) is
+/// handled without re-parsing the finished frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkipMetadata {
+    /// Raw `addbsi` bytes, written after `addbsie`/`addbsil`.  Empty disables
+    /// the `addbsi` field.  At most 64 bytes (the length field is 6 bits).
+    pub addbsi: Vec<u8>,
+    /// EMDF container bytes, carried in one audio block's skip field.  Empty
+    /// disables the skip field.  At most 511 bytes (`skipl` is 9 bits).
+    pub emdf: Vec<u8>,
+    /// Zero-based audio block that carries `emdf`.
+    pub target_block: usize,
+}
+
+impl SkipMetadata {
+    pub fn new(addbsi: &[u8], emdf: &[u8], target_block: usize) -> Self {
+        Self {
+            addbsi: addbsi.to_vec(),
+            emdf: emdf.to_vec(),
+            target_block,
+        }
+    }
+
+    pub(crate) fn has_skip_field(&self) -> bool {
+        !self.emdf.is_empty()
+    }
+
+    pub(crate) fn has_addbsi(&self) -> bool {
+        !self.addbsi.is_empty()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.has_skip_field() && !self.has_addbsi()
+    }
+}
+
+/// Exact bit positions of the fields a metadata injector may patch.
+///
+/// These are absolute bit offsets from the start of [`Frame::bytes`] and remain
+/// valid for the frame that produced them (including any skip-field/addbsi
+/// syntax written natively).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameEdits {
+    /// Audio blocks per syncframe for this frame.
+    pub num_blocks: usize,
+    /// Final syncframe size in bytes, including CRC2.
+    pub frame_size: usize,
+    /// Bit position of the BSI `infomdate` flag and the first bit after its body.
+    pub infomdate_bit: usize,
+    pub info_end_bit: usize,
+    /// Bit position of the BSI `addbsie` flag.
+    pub addbsie_bit: usize,
+    /// Number of `addbsi` bytes written after the flag (0 = no addbsi field).
+    pub addbsi_len: usize,
+    /// Bit position of the `audfrm` `skipFieldSyntaxEnabled` flag.
+    pub skipfld_bit: usize,
+    /// Bit position of each block's skip-field point (before `skiple`, just
+    /// before the mantissa data), matching the E-AC-3 `audblk()` syntax.
+    pub block_skip_points: Vec<usize>,
+    /// Bit position of the first EMDF byte in the target block, or `None`
+    /// when the frame carries no skip-field payload.
+    pub emdf_start_bit: Option<usize>,
+    /// Bit position just after the last written audio/metadata bit, before the
+    /// zero padding and the 16-bit CRC2. Used by frame signers to exclude the
+    /// padded tail.
+    pub audio_end_bit: usize,
+}
+
 /// One encoded syncframe.
 #[derive(Debug, Clone)]
 pub struct Frame {
     pub bytes: Vec<u8>,
     pub index: u64,
+    /// Bit positions of the injectable fields in `bytes`.
+    pub edits: FrameEdits,
 }
 
 /// Running bitrate accounting used to alternate the two legal frame sizes.
@@ -254,6 +365,8 @@ pub struct FrameEncoder {
     pub(crate) blk_sw_syntax: bool,
     block_switch: bool,
     transient: Vec<TransientDetector>,
+    /// Metadata for the frame currently being packed.
+    pub(crate) frame_meta: Option<SkipMetadata>,
 }
 
 impl FrameEncoder {
@@ -295,6 +408,7 @@ impl FrameEncoder {
             blk_sw_syntax: false,
             block_switch: true,
             transient: (0..CH).map(|_| TransientDetector::new()).collect(),
+            frame_meta: None,
         })
     }
 
@@ -327,10 +441,28 @@ impl FrameEncoder {
     /// Encode one frame.  `pcm` must contain exactly `samples_per_frame()`
     /// samples per channel; a shorter final frame is accepted and zero padded.
     pub fn encode_frame(&mut self, pcm: &PlanarFrame<'_>) -> Result<Frame, EncodeError> {
+        self.encode_frame_with_metadata(pcm, None)
+    }
+
+    /// Encode one frame with optional Atmos metadata written into the frame.
+    ///
+    /// The audio is still allocated against the configured CBR core frame size;
+    /// `addbsi` and the skip-field EMDF are appended, so the returned frame is
+    /// larger than the core frame by the metadata overhead.  Block switching,
+    /// coupling, rematrixing and AHT are all handled because the metadata is
+    /// written by the same packer that emits the audio blocks.
+    pub fn encode_frame_with_metadata(
+        &mut self,
+        pcm: &PlanarFrame<'_>,
+        metadata: Option<SkipMetadata>,
+    ) -> Result<Frame, EncodeError> {
         if self.final_frame_seen {
             return Err(EncodeError::Pcm(
                 "cannot encode another frame after a short final frame".into(),
             ));
+        }
+        if let Some(meta) = &metadata {
+            validate_skip_metadata(meta, self.cfg.num_blocks)?;
         }
         let channels = collect_internal_channels(&self.cfg, pcm)?;
         let len = channels[1].len();
@@ -343,7 +475,11 @@ impl FrameEncoder {
         if len < spf {
             self.final_frame_seen = true;
         }
-        self.encode_internal(&channels, len)
+        let result = self.encode_internal(&channels, len, metadata);
+        // Clear even on error so a failed frame cannot leak metadata into the
+        // next one.
+        self.frame_meta = None;
+        result
     }
 
     /// Flush the final partial frame.  `encode_frame` already zero-pads a
@@ -353,9 +489,15 @@ impl FrameEncoder {
         Ok(None)
     }
 
-    fn encode_internal(&mut self, channels: &[&[f32]], valid: usize) -> Result<Frame, EncodeError> {
+    fn encode_internal(
+        &mut self,
+        channels: &[&[f32]],
+        valid: usize,
+        metadata: Option<SkipMetadata>,
+    ) -> Result<Frame, EncodeError> {
         let spf = self.samples_per_frame();
         self.adjust_frame_size();
+        self.frame_meta = metadata.filter(|meta| !meta.is_empty());
 
         // --- block-switch detection and MDCT ---
         let num_blocks = self.cfg.num_blocks;
@@ -456,16 +598,70 @@ impl FrameEncoder {
         self.quantize_mantissas();
 
         let mut w = BitWriter::with_capacity(self.frame_size);
-        header::write_frame_header(self, &mut w);
+        let (addbsie_bit, skipfld_bit, infomdate_bit, info_end_bit) =
+            header::write_frame_header(self, &mut w);
+        let mut block_skip_points = Vec::with_capacity(self.cfg.num_blocks);
         for blk in 0..self.cfg.num_blocks {
-            pack::write_audio_block(self, blk, &mut w);
+            block_skip_points.push(pack::write_audio_block(self, blk, &mut w));
         }
-        let bytes = pack::finalize(w.into_bytes(), self.frame_size)?;
+        let audio_end_bit = w.bits_written();
+        let mut bytes = w.into_bytes();
+
+        // Audio is budgeted against the core CBR frame size; metadata grows the
+        // frame on top of it.  `addbsi` replaces the 1-bit flag, and every block
+        // gains a `skiple` bit (the target block also gets `skipl` + payload).
+        let overhead_bits = self.frame_meta.as_ref().map_or(0, |meta| {
+            let addbsi = if meta.addbsi.is_empty() {
+                0
+            } else {
+                6 + meta.addbsi.len() * 8
+            };
+            let skip = if meta.emdf.is_empty() {
+                0
+            } else {
+                self.cfg.num_blocks + 9 + meta.emdf.len() * 8
+            };
+            addbsi + skip
+        });
+        let frame_size = if self.frame_meta.is_some() {
+            let mut size = (self.frame_size * 8 + overhead_bits).div_ceil(8);
+            if !size.is_multiple_of(2) {
+                size += 1;
+            }
+            if size > MAX_FRAME_BYTES {
+                self.frame_meta = None;
+                return Err(EncodeError::Config(format!(
+                    "frame with metadata is {size} bytes; the E-AC-3 limit is {MAX_FRAME_BYTES}"
+                )));
+            }
+            size
+        } else {
+            self.frame_size
+        };
+        patch_frame_size(&mut bytes, frame_size);
+        let bytes = pack::finalize(bytes, frame_size)?;
 
         let frame = Frame {
             bytes,
             index: self.frame_index,
+            edits: FrameEdits {
+                num_blocks: self.cfg.num_blocks,
+                frame_size,
+                infomdate_bit,
+                info_end_bit,
+                addbsie_bit,
+                addbsi_len: self.frame_meta.as_ref().map_or(0, |meta| meta.addbsi.len()),
+                skipfld_bit,
+                emdf_start_bit: self
+                    .frame_meta
+                    .as_ref()
+                    .filter(|meta| !meta.emdf.is_empty())
+                    .map(|meta| block_skip_points[meta.target_block] + 10),
+                audio_end_bit,
+                block_skip_points,
+            },
         };
+        self.frame_meta = None;
         self.frame_index += 1;
         Ok(frame)
     }
@@ -1212,6 +1408,19 @@ impl StreamEncoder {
     /// Push interleaved samples.  Any number of whole sample frames is
     /// accepted; incomplete encoder frames remain buffered.
     pub fn push_interleaved(&mut self, pcm: &[f32]) -> Result<Vec<Frame>, EncodeError> {
+        self.push_interleaved_with_metadata(pcm, |_| None)
+    }
+
+    /// Like [`StreamEncoder::push_interleaved`], but the callback supplies the
+    /// metadata for each completed syncframe (called with the frame index).
+    pub fn push_interleaved_with_metadata<F>(
+        &mut self,
+        pcm: &[f32],
+        mut metadata_for: F,
+    ) -> Result<Vec<Frame>, EncodeError>
+    where
+        F: FnMut(u64) -> Option<SkipMetadata>,
+    {
         if !pcm.len().is_multiple_of(self.channels) {
             return Err(EncodeError::Pcm(format!(
                 "interleaved length {} is not a multiple of {} channels",
@@ -1224,16 +1433,31 @@ impl StreamEncoder {
                 pending.push(sample);
             }
         }
-        self.drain_full_frames()
+        self.drain_full_frames(&mut metadata_for)
     }
 
     /// Flush the final partial frame (zero padded) and return it.
     pub fn finish(&mut self) -> Result<Vec<Frame>, EncodeError> {
+        self.finish_with_metadata(|_| None)
+    }
+
+    /// Like [`StreamEncoder::finish`], with per-frame metadata.
+    pub fn finish_with_metadata<F>(
+        &mut self,
+        mut metadata_for: F,
+    ) -> Result<Vec<Frame>, EncodeError>
+    where
+        F: FnMut(u64) -> Option<SkipMetadata>,
+    {
         let mut out = Vec::new();
         if !self.pending[0].is_empty() {
+            let index = self.encoder.frame_index;
             let slices: Vec<&[f32]> = self.pending.iter().map(|c| c.as_slice()).collect();
             let pcm = PlanarFrame::new(&slices, ChannelOrder::Smpte);
-            out.push(self.encoder.encode_frame(&pcm)?);
+            out.push(
+                self.encoder
+                    .encode_frame_with_metadata(&pcm, metadata_for(index))?,
+            );
             for ch in &mut self.pending {
                 ch.clear();
             }
@@ -1241,13 +1465,20 @@ impl StreamEncoder {
         Ok(out)
     }
 
-    fn drain_full_frames(&mut self) -> Result<Vec<Frame>, EncodeError> {
+    fn drain_full_frames<F>(&mut self, metadata_for: &mut F) -> Result<Vec<Frame>, EncodeError>
+    where
+        F: FnMut(u64) -> Option<SkipMetadata>,
+    {
         let spf = self.encoder.samples_per_frame();
         let mut out = Vec::new();
         while self.pending[0].len() >= spf {
+            let index = self.encoder.frame_index;
             let slices: Vec<&[f32]> = self.pending.iter().map(|c| &c[..spf]).collect();
             let pcm = PlanarFrame::new(&slices, ChannelOrder::Smpte);
-            out.push(self.encoder.encode_frame(&pcm)?);
+            out.push(
+                self.encoder
+                    .encode_frame_with_metadata(&pcm, metadata_for(index))?,
+            );
             for ch in &mut self.pending {
                 ch.drain(..spf);
             }
@@ -1350,6 +1581,302 @@ mod tests {
         assert!(encoder.blksw[2][0]);
         assert!(!encoder.blksw[1][1]);
         assert!(!encoder.blksw[2][1]);
+    }
+
+    fn metadata_frame(
+        encoder: &mut FrameEncoder,
+        freq: f64,
+        transient: bool,
+        metadata: Option<SkipMetadata>,
+    ) -> Frame {
+        let spf = encoder.samples_per_frame();
+        let channels = encoder.cfg.channels;
+        let data: Vec<Vec<f32>> = (0..channels)
+            .map(|ch| {
+                (0..spf)
+                    .map(|i| {
+                        let t = i as f64 / SAMPLE_RATE as f64;
+                        let mut value = (0.2
+                            * (2.0 * std::f64::consts::PI * (freq + ch as f64 * 97.0) * t).sin())
+                            as f32;
+                        if transient && i < 128 {
+                            let envelope = (-(i as f64) / 32.0).exp();
+                            value += (0.7 * envelope) as f32;
+                        }
+                        value.clamp(-1.0, 1.0)
+                    })
+                    .collect()
+            })
+            .collect();
+        let slices: Vec<&[f32]> = data.iter().map(|channel| channel.as_slice()).collect();
+        encoder
+            .encode_frame_with_metadata(&PlanarFrame::new(&slices, ChannelOrder::Smpte), metadata)
+            .unwrap()
+    }
+
+    fn bits_of(bytes: &[u8]) -> Vec<u8> {
+        let mut bits = Vec::with_capacity(bytes.len() * 8);
+        for byte in bytes {
+            for shift in (0..8).rev() {
+                bits.push((byte >> shift) & 1);
+            }
+        }
+        bits
+    }
+
+    fn read_bits(bits: &[u8], position: usize, count: usize) -> u32 {
+        assert!(position + count <= bits.len());
+        bits[position..position + count]
+            .iter()
+            .fold(0u32, |value, &bit| (value << 1) | u32::from(bit))
+    }
+
+    fn check_metadata_frame(frame: &Frame, metadata: &SkipMetadata) {
+        let bits = bits_of(&frame.bytes);
+        assert_eq!(read_bits(&bits, 0, 16), 0x0B77, "sync word");
+        let frmsiz = read_bits(&bits, 21, 11) as usize;
+        assert_eq!(frmsiz + 1, frame.bytes.len() / 2, "frmsiz matches bytes");
+        assert_eq!(frame.edits.frame_size, frame.bytes.len());
+
+        let end = frame.bytes.len();
+        let stored = u16::from_be_bytes([frame.bytes[end - 2], frame.bytes[end - 1]]);
+        assert_eq!(stored, crate::pack::crc16(&frame.bytes[2..end - 2]));
+
+        let addbsi_bit = frame.edits.addbsie_bit;
+        assert_eq!(
+            read_bits(&bits, addbsi_bit, 1),
+            u32::from(!metadata.addbsi.is_empty()),
+            "addbsie"
+        );
+        if !metadata.addbsi.is_empty() {
+            let len = read_bits(&bits, addbsi_bit + 1, 6) as usize + 1;
+            assert_eq!(len, metadata.addbsi.len());
+            for (index, &byte) in metadata.addbsi.iter().enumerate() {
+                assert_eq!(read_bits(&bits, addbsi_bit + 7 + index * 8, 8) as u8, byte);
+            }
+        }
+
+        let skip_enabled = !metadata.emdf.is_empty();
+        assert_eq!(
+            read_bits(&bits, frame.edits.skipfld_bit, 1),
+            u32::from(skip_enabled),
+            "skipFieldSyntaxEnabled"
+        );
+        assert_eq!(frame.edits.block_skip_points.len(), frame.edits.num_blocks);
+        assert!(
+            frame
+                .edits
+                .block_skip_points
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "skip points must increase"
+        );
+        if skip_enabled {
+            assert_eq!(
+                frame.edits.emdf_start_bit,
+                Some(frame.edits.block_skip_points[metadata.target_block] + 10)
+            );
+            for (block, &point) in frame.edits.block_skip_points.iter().enumerate() {
+                if block == metadata.target_block {
+                    assert_eq!(read_bits(&bits, point, 1), 1, "target skiple");
+                    assert_eq!(
+                        read_bits(&bits, point + 1, 9) as usize,
+                        metadata.emdf.len(),
+                        "skipl"
+                    );
+                    for (index, &byte) in metadata.emdf.iter().enumerate() {
+                        assert_eq!(
+                            read_bits(&bits, point + 10 + index * 8, 8) as u8,
+                            byte,
+                            "emdf byte {index}"
+                        );
+                    }
+                } else {
+                    assert_eq!(read_bits(&bits, point, 1), 0, "empty skiple");
+                }
+            }
+        }
+    }
+
+    fn config(bitrate_bps: u32, coupling: Coupling) -> EncoderConfig {
+        EncoderConfig {
+            layout: ChannelLayout {
+                acmod: Acmod::ThreeTwo,
+                lfe: true,
+            },
+            bitrate_bps,
+            dialnorm: -27,
+            metadata: Default::default(),
+            coupling,
+            stereo_rematrixing: true,
+            cutoff_hz: None,
+            coupling_start: None,
+        }
+    }
+
+    fn metadata_at(target_block: usize) -> SkipMetadata {
+        SkipMetadata::new(
+            &[0x01, 0x10],
+            &[0x58, 0x38, 0xAA, 0x55, 0x01, 0x02, 0x03],
+            target_block,
+        )
+    }
+
+    fn metadata() -> SkipMetadata {
+        metadata_at(2)
+    }
+
+    #[test]
+    fn metadata_is_written_into_the_skip_field() {
+        let mut encoder = FrameEncoder::new(config(693_000, Coupling::Off)).unwrap();
+        let meta = metadata();
+        let frame = metadata_frame(&mut encoder, 440.0, false, Some(meta.clone()));
+        assert_eq!(frame.edits.num_blocks, 6);
+        check_metadata_frame(&frame, &meta);
+    }
+
+    #[test]
+    fn metadata_grows_the_core_frame_by_the_overhead() {
+        let cfg = config(693_000, Coupling::Off);
+        let meta = metadata();
+        let mut plain_encoder = FrameEncoder::new(cfg.clone()).unwrap();
+        let mut tagged_encoder = FrameEncoder::new(cfg).unwrap();
+        let plain = metadata_frame(&mut plain_encoder, 440.0, false, None);
+        let tagged = metadata_frame(&mut tagged_encoder, 440.0, false, Some(meta.clone()));
+
+        let overhead = 6 + meta.addbsi.len() * 8 + plain.edits.num_blocks + 9 + meta.emdf.len() * 8;
+        let mut expected = (plain.bytes.len() * 8 + overhead).div_ceil(8);
+        if !expected.is_multiple_of(2) {
+            expected += 1;
+        }
+        assert_eq!(tagged.bytes.len(), expected);
+        assert_eq!(plain.bytes.len(), plain.edits.frame_size);
+
+        // Two-pass injection must produce the same final size as the one-pass
+        // writer for the same core.
+        let injected = crate::inject::inject_metadata(&plain, &meta).unwrap();
+        assert_eq!(injected.bytes.len(), tagged.bytes.len());
+    }
+
+    #[test]
+    fn metadata_works_with_coupling() {
+        let mut encoder = FrameEncoder::new(config(256_000, Coupling::Auto)).unwrap();
+        let meta = metadata();
+        let frame = metadata_frame(&mut encoder, 440.0, false, Some(meta.clone()));
+        assert!(encoder.cpl_on, "test must exercise coupling");
+        check_metadata_frame(&frame, &meta);
+    }
+
+    #[test]
+    fn metadata_works_with_block_switching() {
+        let mut encoder = FrameEncoder::new(config(256_000, Coupling::Off)).unwrap();
+        // A silent lead-in keeps the block-switch detector from firing on
+        // history; the transient frame then sets blksw syntax.
+        let _ = metadata_frame(&mut encoder, 440.0, false, None);
+        let meta = metadata();
+        let frame = metadata_frame(&mut encoder, 440.0, true, Some(meta.clone()));
+        assert!(encoder.blk_sw_syntax, "test must exercise block switching");
+        check_metadata_frame(&frame, &meta);
+    }
+
+    #[test]
+    fn metadata_works_for_every_block_count() {
+        // >1.024 Mbps selects 3 blocks, >2.048 Mbps selects 2, >4.096 Mbps
+        // selects 1 in `select_block_code`.
+        for (bitrate, expected_blocks) in
+            [(693_000, 6), (1_500_000, 3), (3_000_000, 2), (5_000_000, 1)]
+        {
+            let mut encoder = FrameEncoder::new(config(bitrate, Coupling::Off)).unwrap();
+            assert_eq!(encoder.cfg.num_blocks, expected_blocks);
+            let meta = metadata_at(expected_blocks - 1);
+            let frame = metadata_frame(&mut encoder, 1_000.0, false, Some(meta.clone()));
+            assert_eq!(frame.edits.num_blocks, expected_blocks);
+            check_metadata_frame(&frame, &meta);
+        }
+    }
+
+    #[test]
+    fn metadata_works_with_stereo_rematrixing() {
+        let mut cfg = config(192_000, Coupling::Off);
+        cfg.layout = ChannelLayout {
+            acmod: Acmod::Stereo,
+            lfe: false,
+        };
+        cfg.stereo_rematrixing = true;
+        let mut encoder = FrameEncoder::new(cfg).unwrap();
+        assert!(encoder.cfg.rematrixing_enabled);
+        let meta = metadata();
+        let frame = metadata_frame(&mut encoder, 440.0, false, Some(meta.clone()));
+        check_metadata_frame(&frame, &meta);
+    }
+
+    #[test]
+    fn metadata_works_with_aht() {
+        let mut encoder = FrameEncoder::new(config(256_000, Coupling::Off)).unwrap();
+        encoder.set_aht_enabled(true);
+        encoder.set_block_switch(false);
+        let meta = metadata();
+        let _ = metadata_frame(&mut encoder, 20.0, false, None);
+        let frame = metadata_frame(&mut encoder, 20.0, false, Some(meta.clone()));
+        assert!(encoder.aht_used, "test must exercise AHT");
+        check_metadata_frame(&frame, &meta);
+    }
+
+    #[test]
+    fn metadata_works_without_addbsi_or_emdf() {
+        let mut encoder = FrameEncoder::new(config(448_000, Coupling::Off)).unwrap();
+        let empty = SkipMetadata::new(&[], &[], 0);
+        let frame = metadata_frame(&mut encoder, 440.0, false, Some(empty.clone()));
+        check_metadata_frame(&frame, &empty);
+        // A truly metadata-free frame still reports usable edit positions.
+        let plain = metadata_frame(&mut encoder, 440.0, false, None);
+        assert_eq!(
+            read_bits(&bits_of(&plain.bytes), plain.edits.addbsie_bit, 1),
+            0
+        );
+        assert_eq!(
+            read_bits(&bits_of(&plain.bytes), plain.edits.skipfld_bit, 1),
+            0
+        );
+    }
+
+    #[test]
+    fn metadata_is_validated() {
+        let mut encoder = FrameEncoder::new(config(448_000, Coupling::Off)).unwrap();
+        let too_many_addbsi = SkipMetadata::new(&[0; 65], &[], 0);
+        let too_large_emdf = SkipMetadata::new(&[], &[0; 512], 0);
+        let bad_block = SkipMetadata::new(&[], &[0; 4], 6);
+        let silence = vec![0.0f32; encoder.samples_per_frame()];
+        let channels = vec![&silence[..]; encoder.cfg.channels];
+        let pcm = PlanarFrame::new(&channels, ChannelOrder::Smpte);
+        for meta in [too_many_addbsi, too_large_emdf, bad_block] {
+            assert!(matches!(
+                encoder.encode_frame_with_metadata(&pcm, Some(meta)),
+                Err(EncodeError::Config(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn stream_encoder_forwards_per_frame_metadata() {
+        let mut encoder = StreamEncoder::new(config(693_000, Coupling::Off)).unwrap();
+        let spf = encoder.encoder.samples_per_frame();
+        let channels = encoder.channels;
+        let samples: Vec<f32> = (0..spf)
+            .flat_map(|i| {
+                (0..channels).map(move |ch| {
+                    (0.2 * (2.0 * std::f64::consts::PI * (440.0 + ch as f64 * 100.0) * i as f64
+                        / SAMPLE_RATE as f64)
+                        .sin()) as f32
+                })
+            })
+            .collect();
+        let meta = metadata();
+        let frames = encoder
+            .push_interleaved_with_metadata(&samples, |_| Some(meta.clone()))
+            .unwrap();
+        assert_eq!(frames.len(), 1);
+        check_metadata_frame(&frames[0], &meta);
     }
 
     #[test]

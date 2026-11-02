@@ -4,15 +4,23 @@ use crate::bitwriter::BitWriter;
 use crate::encoder::FrameEncoder;
 use crate::tables::{AC3_CHMODE_2F2R, AC3_CHMODE_MONO, AC3_CHMODE_STEREO};
 
-pub(crate) fn write_frame_header(enc: &FrameEncoder, w: &mut BitWriter) {
+/// Write the BSI and audio-frame header.
+///
+/// Returns the bit positions of the `addbsie` and `skipFieldSyntaxEnabled`
+/// flags so a caller can inspect or patch them.
+pub(crate) fn write_frame_header(
+    enc: &FrameEncoder,
+    w: &mut BitWriter,
+) -> (usize, usize, usize, usize) {
     write_sync_info(enc, w);
     write_mixing_metadata(enc, w);
-    write_info_metadata(enc, w);
-    write_frame_flags(enc, w);
+    let (infomdate_bit, info_end_bit) = write_info_metadata(enc, w);
+    let (addbsie_bit, skipfld_bit) = write_frame_flags(enc, w);
     write_coupling_strategy(enc, w);
     write_exponent_strategies(enc, w);
     write_aht_info(enc, w);
     write_snr_offsets(enc, w);
+    (addbsie_bit, skipfld_bit, infomdate_bit, info_end_bit)
 }
 
 fn write_sync_info(enc: &FrameEncoder, w: &mut BitWriter) {
@@ -63,13 +71,14 @@ fn write_mixing_metadata(enc: &FrameEncoder, w: &mut BitWriter) {
     w.write_bool(false); // no frame mixing configuration
 }
 
-fn write_info_metadata(enc: &FrameEncoder, w: &mut BitWriter) {
+fn write_info_metadata(enc: &FrameEncoder, w: &mut BitWriter) -> (usize, usize) {
     let cfg = &enc.cfg;
     let meta = &cfg.metadata;
 
+    let infomdate_bit = w.bits_written();
     w.write_bool(meta.eac3_info_metadata);
     if !meta.eac3_info_metadata {
-        return;
+        return (infomdate_bit, w.bits_written());
     }
 
     w.write(3, meta.bitstream_mode as u32);
@@ -88,17 +97,34 @@ fn write_info_metadata(enc: &FrameEncoder, w: &mut BitWriter) {
         w.write(2, meta.room_type as u32);
         w.write_bool(meta.ad_converter_type != 0);
     }
-    w.write_bool(false);
+    w.write_bool(false); // sourcefscod
+    (infomdate_bit, w.bits_written())
 }
 
-fn write_frame_flags(enc: &FrameEncoder, w: &mut BitWriter) {
+/// Write the BSI `addbsi` field and return the position of its enable flag.
+fn write_addbsi(enc: &FrameEncoder, w: &mut BitWriter) -> usize {
+    let addbsie_bit = w.bits_written();
+    match &enc.frame_meta {
+        Some(meta) if !meta.addbsi.is_empty() => {
+            w.write_bool(true);
+            w.write(6, (meta.addbsi.len() - 1) as u32);
+            for &byte in &meta.addbsi {
+                w.write(8, byte as u32);
+            }
+        }
+        _ => w.write_bool(false),
+    }
+    addbsie_bit
+}
+
+fn write_frame_flags(enc: &FrameEncoder, w: &mut BitWriter) -> (usize, usize) {
     let cfg = &enc.cfg;
 
     if cfg.num_blocks != 6 {
         // Converter sync: one in every six frames.
         w.write_bool(enc.frame_index.is_multiple_of(6));
     }
-    w.write_bool(false); // no additional bitstream info
+    let addbsie_bit = write_addbsi(enc, w);
 
     if cfg.num_blocks == 6 {
         w.write_bool(!enc.use_frame_exp_strategy);
@@ -111,8 +137,14 @@ fn write_frame_flags(enc: &FrameEncoder, w: &mut BitWriter) {
     w.write_bool(false); // bit allocation model syntax disabled
     w.write_bool(false); // fast gain codes disabled
     w.write_bool(false); // delta bit allocation disabled
-    w.write_bool(false); // skip field syntax disabled
+    let skipfld_bit = w.bits_written();
+    w.write_bool(
+        enc.frame_meta
+            .as_ref()
+            .is_some_and(|meta| !meta.emdf.is_empty()),
+    );
     w.write_bool(false); // spectral extension disabled
+    (addbsie_bit, skipfld_bit)
 }
 
 fn write_coupling_strategy(enc: &FrameEncoder, w: &mut BitWriter) {
